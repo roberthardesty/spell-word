@@ -1,0 +1,13 @@
+idf_component_register(
+    SRCS
+        "segmenter.c"
+        "segmenter_core.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        spell_common
+        audio_capture
+        letter_classifier
+        esp_event
+        esp_timer
+)

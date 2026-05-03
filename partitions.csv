@@ -1,0 +1,22 @@
+# Spell-Word partition table.
+#
+# Targets the N16R8 (16 MB flash) part for bring-up. To target the N8R8
+# (8 MB flash) variant, shrink "corpus" to ~3.5 MB and the totals must
+# still fit under 8 MB; see docs/MVP-Implementation-Plan.md §10.
+#
+# Custom data subtypes:
+#   0x80 — model           (TFLite flatbuffer, OTA-replaceable)
+#   0x81 — confusion_matrix (26x26 float32 row-major, ~2.7 KB used)
+#   0x82 — dictionary       (binary word list + log-frequency)
+#   0x83 — corpus           (Opus-encoded word audio, packed blob)
+#   0x84 — corpus_idx       (word_id → byte_offset/length lookup)
+#
+# Name,         Type, SubType,  Offset,    Size,        Flags
+nvs,            data, nvs,      0x9000,    0x6000,
+phy_init,       data, phy,      0xf000,    0x1000,
+factory,        app,  factory,  0x10000,   0x200000,
+model,          data, 0x80,     ,          0x40000,
+confusion,      data, 0x81,     ,          0x4000,
+dictionary,     data, 0x82,     ,          0x20000,
+corpus,         data, 0x83,     ,          0x800000,
+corpus_idx,     data, 0x84,     ,          0x10000,

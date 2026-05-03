@@ -1,0 +1,10 @@
+idf_component_register(
+    SRCS
+        "audio_dump.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        spell_common
+        audio_capture
+        esp_timer
+)

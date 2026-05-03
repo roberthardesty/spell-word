@@ -1,0 +1,15 @@
+A reading companion that fits in a pocket
+
+Learning to read is full of small moments where everything stalls. A kid is making it through a story, hits a word they don't know, and the spell breaks. They need a parent, a teacher, or a dictionary, and usually none of those are within reach.
+
+The product: a small battery-powered device that clips to any book. When a young reader gets stuck, they press one button and spell the word out loud, letter by letter. The device figures out what they meant and reads it back to them.
+
+No screen. No app. No internet. Just one button, a mic, a speaker, and some tiny machine learning models.
+
+Why it matters: early reading fluency is one of the strongest predictors of long-term academic outcomes, and the biggest enemy of fluency is friction. Every unknown word is a chance to disengage. Other tools either need expensive hardware, pull kids onto screens, or assume an adult is nearby. This is the opposite. It's cheap, private, kids can use it on their own, and it's meant to live alongside whatever physical book is in their hands.
+
+How it works: there's a small microcontroller inside running a neural net trained on spoken letters. It matches what the child spells against the 3,000 most common English words and plays a pre-recorded pronunciation. Everything happens on the device. No audio uploaded, no account, no data leaving the unit.
+
+Who it's for: early and struggling readers, roughly ages 5 to 10. ESL learners building vocabulary. Parents who want a screen-free literacy tool. Classrooms and libraries where one tablet per kid isn't realistic but books are everywhere.
+
+The bet: a single-purpose ~$25 object beats a $500 tablet running a $10 app, because the limitation IS the feature. It does one thing, so a kid can use it without help and a parent can hand it over without worry.

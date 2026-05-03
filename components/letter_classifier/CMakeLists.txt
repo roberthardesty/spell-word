@@ -1,0 +1,15 @@
+idf_component_register(
+    SRCS
+        "feat_extract.c"
+        "inference.cpp"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        spell_common
+        audio_capture
+        esp-dsp
+        esp-tflite-micro
+        esp_event
+        esp_timer
+        esp_partition
+)
