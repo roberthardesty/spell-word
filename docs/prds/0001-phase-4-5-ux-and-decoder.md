@@ -8,11 +8,11 @@ The current firmware can capture audio, segment letter-utterances, and run infer
 
 ## Solution
 
-Three new pure-C deep modules and one segmenter extension, integrated into a state machine that runs the full press-to-spell-to-speak loop.
+Two new pure-C deep modules, an extension of the existing inference module into a deeper **letter recognizer**, and a segmenter extension, integrated into a state machine that runs the full press-to-spell-to-speak loop.
 
-The decoder turns a sequence of top-K events into a resolved word via dictionary scoring with confusion-matrix-aware posteriors and bounded edit-distance, and commits *aggressively* — as soon as a three-clause predicate (margin over runner-up, margin over best longer candidate, post-letter silence floor) is satisfied — instead of waiting for full end-of-word silence.
+The decoder turns a sequence of letter events into a resolved word via dictionary scoring with confusion-matrix-aware posteriors and bounded edit-distance, and commits *aggressively* — as soon as a three-clause predicate (margin over runner-up, margin over best longer candidate, post-letter silence floor) is satisfied — instead of waiting for full end-of-word silence.
 
-The W detector watches the stream of top-K events post-inference. When it sees a high-confidence "U" preceded by two low-confidence utterances, it re-runs inference on the concatenated PCM of all three and, if the result is a confident "W," emits a retract-and-replace signal that tells the decoder to swap those three letters for one W in its in-flight word buffer. This costs nothing on normal spelling and adds ~40 ms (one extra inference cycle) only when a W candidate is in flight.
+The **letter recognizer** (deepened from the previous `letter_classifier`) owns audio-to-evidence for a single letter position end-to-end: first-pass inference, the PCM ring (last 4 utterance buffers, ~100 KB PSRAM), the W-recovery cycle, and the unified `LETTER_RECOGNIZED { top_k, retract_count }` event emission. When the W-trigger predicate fires (high-confidence "U" after two low-confidence utterances), the recognizer **holds the U emission**, re-runs inference on the concatenated PCM of all three (~40 ms), and emits one event: either the original U top-K with `retract_count = 0`, or the merged W top-K with `retract_count = 2`. The U is never emitted as an independent event; the decoder never sees an inconsistent (U-then-retract) state. Cost: 0 ms on normal spelling, ~40 ms only when a W candidate is in flight.
 
 The UX module owns button input, the IDLE/ARMED/SPELLING/RESOLVING/PLAYING state machine, audible tone feedback (confirmation, resolved, error chirp), the I2S TX path, and a cancel-and-re-arm interruption flow during playback.
 
@@ -43,23 +43,22 @@ The UX module owns button input, the IDLE/ARMED/SPELLING/RESOLVING/PLAYING state
 23. As a **firmware engineer**, I want a host-side `decoder_replay` tool, so that I can sweep decoder parameters against fixtures in seconds rather than minutes.
 24. As a **firmware engineer**, I want a host-side `w_detector_replay` tool that operates on top-K event streams, so that I can validate trigger logic without recording or re-running real audio.
 25. As a **firmware engineer**, I want each spelling attempt to log a single summary line — input letters → resolved word + score margin + commit reason (early vs full-EOW) + W-detection events — so that I can scan a session log quickly.
-26. As a **firmware engineer**, I want the inference component to retain the last N utterance PCM buffers in PSRAM, so that the W detector can re-run inference on the merged audio without changing the segmenter contract.
-27. As a **firmware engineer**, I want the decoder to support a retract-and-replace operation on its in-flight word buffer, so that the W detector can correct three letters into one without race conditions against early commit.
+26. As a **firmware engineer**, I want the letter recognizer to retain the last N utterance PCM buffers in PSRAM internally, so that W-recovery can re-run inference on the merged audio without changing the segmenter contract or exposing internal state through a public API.
+27. As a **firmware engineer**, I want the decoder's letter-event handler to apply `retract_count` uniformly on every `LETTER_RECOGNIZED` event, so that W-recovery corrections and normal letter additions go through one code path with no special "retract" branch and no race against early commit.
 
 ## Implementation Decisions
 
 ### Modules
 
-- **`components/decoder/`** — owns "letters → word" end-to-end. Inputs: top-K events, retract-and-replace events (new), early-commit-window events, EOW events. Outputs: `WORD_RESOLVED { word_id, commit_reason }` or `WORD_ABSTAIN`. Internally split into `decoder_core` (pure C99, host-portable) and a thin IDF wrapper for partition loading and `esp_event` plumbing.
+- **`components/decoder/`** — owns "letters → word" end-to-end. Inputs: `LETTER_RECOGNIZED` events, early-commit-window events, EOW events. Outputs: `WORD_RESOLVED { word_id, commit_reason }` or `WORD_ABSTAIN`. Internally split into `decoder_core` (pure C99, host-portable) and a thin IDF wrapper for partition loading and `esp_event` plumbing.
 - **`components/spell_ui/`** — owns "press → speak" end-to-end. Includes button + debounce, the IDLE/ARMED/SPELLING/RESOLVING/PLAYING state machine, tone synthesis at boot, the I2S TX channel, the playback queue worker, amp-shutdown gating, and cooperative cancel. Internally split into `ui_core` (pure transition table, host-testable) and an IDF wrapper that materializes actions.
-- **`components/w_detector/`** — owns the "recognize W as a single letter" capability end-to-end. Subscribes to top-K events; when the trigger pattern fires, re-runs inference on concatenated PCM of the last three utterances and, on a confident W, emits a retract-and-replace event to the decoder. Internally split into `w_detector_core` (pure C99 — trigger logic on top-K-event metadata, no PCM, no inference) and an IDF wrapper that owns the PCM ring access, re-inference dispatch, and event publication.
+- **`components/letter_recognizer/`** (deepened from the previous `letter_classifier`) — owns audio-to-letter-evidence end-to-end: first-pass inference, the PCM ring (last 4 utterance buffers in PSRAM, ~100 KB), the W-trigger predicate, the merge-and-rerun cycle, and the unified `LETTER_RECOGNIZED { top_k, retract_count }` event emission. The PCM ring and trigger state are purely internal — no external Module reaches into them. Internally split into `inference_run(pcm) → top_k` (pure-function signal pipeline: MFCC + TFLM + softmax + top-K, host-testable), `w_detector_core` (pure C99 — trigger predicate on top-K event metadata, no PCM, host-testable), and the recognizer task that orchestrates them. ADR-0005 formalizes the W-recovery cycle; ADR-0006 formalizes the unified event vocabulary.
 - **`components/segmenter/`** (extended) — `seg_core` gains `SEG_EVT_EARLY_COMMIT_WINDOW`, fired exactly once per inter-letter silence cycle when the post-letter frame count crosses the early-commit threshold. Latch resets on next letter onset. The IDF wrapper publishes `SPELL_EVENT_EARLY_COMMIT_WINDOW`.
-- **`components/letter_classifier/`** (extended) — retains the last N=4 utterance PCM buffers in a PSRAM ring (3 in detection window + 1 currently being processed) instead of freeing immediately after inference. Exposes `inference_get_recent_pcm(int back_index)` for the W detector. The ring is sized at `4 × SPELL_INFERENCE_WINDOW_BYTES ≈ 100 KB`.
 
 ### Public interface shapes
 
-- **Decoder** subscribes to `SPELL_INFERENCE_EVENT::LETTER_TOP_K`, `SPELL_W_DETECTOR_EVENT::RETRACT_AND_REPLACE`, `SPELL_SEGMENTER_EVENT::EARLY_COMMIT_WINDOW`, `SPELL_SEGMENTER_EVENT::END_OF_WORD`. Publishes `SPELL_DECODER_EVENT::WORD_RESOLVED` and `WORD_ABSTAIN`.
-- **W detector** subscribes to `SPELL_INFERENCE_EVENT::LETTER_TOP_K`. When trigger fires, calls `inference_run_synchronous(merged_pcm)` (or its async equivalent with a callback) and, on confident W, posts `SPELL_W_DETECTOR_EVENT::RETRACT_AND_REPLACE { retract_count: 3, replacement: top_k_event }`. Latency: zero when no trigger, ~40 ms when triggered.
+- **Letter recognizer** accepts utterance PCM via `letter_recognizer_submit_utterance(pcm, n_samples)` from the segmenter. Publishes one event type: `SPELL_RECOGNIZER_EVENT::LETTER_RECOGNIZED { top_k, retract_count }`. `retract_count = 0` is the normal case (every utterance); `retract_count = 2` fires only when W-recovery confirms a multi-utterance W (per ADR-0005). The PCM ring, top-K history, and W-trigger evaluation are internal; no public access function exists for the ring.
+- **Decoder** subscribes to `SPELL_RECOGNIZER_EVENT::LETTER_RECOGNIZED`, `SPELL_SEGMENTER_EVENT::EARLY_COMMIT_WINDOW`, `SPELL_SEGMENTER_EVENT::END_OF_WORD`. Publishes `SPELL_DECODER_EVENT::WORD_RESOLVED` and `WORD_ABSTAIN`. The letter-event handler is a single code path: drop `retract_count` entries from in-flight buffer, append `top_k`. No special "retract" branch; no race against early commit.
 - **UI** subscribes to button events, `SPELL_DECODER_EVENT::WORD_RESOLVED` / `WORD_ABSTAIN`, and `SPELL_PLAYBACK_EVENT::COMPLETE`. Drives `segmenter_set_active`, `playback_play_tone`, `playback_play_word` (Phase 6 stub), `playback_cancel`.
 
 ### Aggressive early-commit predicate
@@ -93,45 +92,50 @@ posterior[c] = (1 - α) · net_prob[c] + α · M[top1, c]
 
 α = `SPELL_DECODER_ALPHA` (default 0.15, retained per ADR-0002).
 
-### W-detection trigger
+### W-recovery cycle (inside the letter recognizer)
 
-Examined on each new top-K event arriving at the W detector. Define:
+Evaluated on each new utterance's first-pass top-K, *before* the recognizer emits `LETTER_RECOGNIZED`. Define:
 
-- `current_top1` = top-K[0].letter_index of the new event
-- `current_prob` = top-K[0].probability of the new event
-- `prev_top1_prob[k]` = top-K[0].probability of the event k positions before the new event
+- `current_top1` = top-K[0].letter_index of the new utterance
+- `current_prob` = top-K[0].probability of the new utterance
+- `prev_top1_prob[k]` = top-K[0].probability of the utterance k positions before the new one (from the recognizer's internal top-K history)
 
 Trigger:
 
 ```
-fire_w_detection IFF
+fire_w_recovery IFF
     current_top1 == 'U'
   AND current_prob          ≥ SPELL_W_DETECT_U_THRESHOLD          (default 0.50)
   AND prev_top1_prob[1]     <  SPELL_W_DETECT_LOW_CONF_THRESHOLD  (default 0.40)
   AND prev_top1_prob[2]     <  SPELL_W_DETECT_LOW_CONF_THRESHOLD  (default 0.40)
-  AND we have PCM for prev[1] and prev[2] in the inference ring
+  AND we have PCM for prev[1] and prev[2] in the recognizer's PCM ring
 ```
 
-On fire: concatenate the three PCM buffers (with the inter-utterance gaps preserved as silence — total ≤ `3 × SPELL_INFERENCE_WINDOW_SAMPLES`, post-trim to the trailing 800 ms slice if over-length, since the model expects a fixed 800 ms window), submit for re-inference. On result:
+On fire: the recognizer **holds the U emission** (no `LETTER_RECOGNIZED` posted yet), concatenates the three PCM buffers (inter-utterance gaps preserved as silence; total ≤ `3 × SPELL_INFERENCE_WINDOW_SAMPLES`, post-trim to the trailing 800 ms slice if over-length since the model expects a fixed 800 ms window), and synchronously calls `inference_run(merged_pcm) → top_k` on the same TFLM interpreter (single-arena, single-task constraint — the recognizer task is the only TFLM caller). On result:
 
 ```
 confirm_w IFF
-    new_top_k[0].letter_index == 'W'
-  AND new_top_k[0].probability ≥ SPELL_W_DETECT_CONFIRM_THRESHOLD (default 0.70)
+    merged_top_k[0].letter_index == 'W'
+  AND merged_top_k[0].probability ≥ SPELL_W_DETECT_CONFIRM_THRESHOLD (default 0.70)
 ```
 
-If confirmed: emit `SPELL_W_DETECTOR_EVENT::RETRACT_AND_REPLACE { retract_count: 3, replacement: new_top_k_event }`. Otherwise: do nothing (the original three top-K events stay in the decoder's buffer; if the result is plausibly a real word containing those three letters, edit-distance recovery still gets a chance).
+The recognizer then emits exactly one event:
 
-### Decoder retract-and-replace
+- **Confirmed W**: `LETTER_RECOGNIZED { top_k = merged_top_k, retract_count = 2 }` — decoder drops the two prior low-confidence emissions and appends W.
+- **Not confirmed**: `LETTER_RECOGNIZED { top_k = original U top_k, retract_count = 0 }` — normal U emission, retroactively the U was just a U.
 
-The decoder supports `decoder_on_retract_and_replace(count, replacement)`:
+The U is never emitted as an independent event. The decoder never sees an inconsistent (U-then-retract) state, so there is no race against early commit. Latency: 0 ms on normal spelling; the U emission is delayed by ~40 ms on the rare W-trigger cycle, well within ADR-0001's 500 ms early-commit silence floor.
 
-- Pops the most recent `count` top-K events from its in-flight word buffer
-- Pushes the `replacement` event
-- Re-evaluates its margin / posterior caches as if the sequence were always `[..., replacement]`
+### Decoder letter-event handler (unified)
+
+The decoder's `LETTER_RECOGNIZED` handler is one code path:
+
+- Pops the most recent `retract_count` entries from its in-flight word buffer (no-op when `retract_count = 0`, the common case)
+- Pushes `top_k`
+- Re-evaluates its margin / posterior caches as if the sequence were always `[..., top_k]`
 - Does not commit early as part of this operation; commit decisions still flow through the normal predicate path on the next event.
 
-Race: a retract event arriving at the decoder *after* the decoder has already committed (early-commit fired before re-inference completed) is logged and dropped. The 500 ms silence floor makes this race vanishingly unlikely in practice but the safety check is cheap.
+No "retract-after-commit" race exists under the variant 2 wire model — the recognizer holds the U emission until the W-recovery cycle resolves, so the decoder receives the corrected sequence atomically. Race-handling code from earlier drafts of this design is removed.
 
 ### Confusion matrix and dictionary loading
 
@@ -148,7 +152,7 @@ Both load at decoder init from custom data partitions (`matrix` / subtype 0x81; 
 - `SPELL_DECODER_EVENT` base with `WORD_RESOLVED` and `WORD_ABSTAIN` IDs and payloads.
 - `SPELL_PLAYBACK_EVENT` base with `COMPLETE` ID.
 - `SPELL_UI_EVENT` base for state-transition events.
-- `SPELL_W_DETECTOR_EVENT` base with `RETRACT_AND_REPLACE` ID and payload (retract_count + replacement top-K event).
+- `SPELL_RECOGNIZER_EVENT` base with `LETTER_RECOGNIZED { top_k, retract_count }` ID and payload (per ADR-0006). Replaces the previously declared `SPELL_INFERENCE_EVENT::LETTER_TOP_K` and `SPELL_W_DETECTOR_EVENT::RETRACT_AND_REPLACE`.
 - `SPELL_EVENT_EARLY_COMMIT_WINDOW = 3` added to the existing `SPELL_SEGMENTER_EVENT` enum.
 
 ### Cancel ordering contract
@@ -158,18 +162,23 @@ Both load at decoder init from custom data partitions (`matrix` / subtype 0x81; 
 ### Dataflow
 
 ```
-mic → audio_capture → segmenter → inference ──top-K──┬──► decoder ──► spell_ui ──► speaker
-                                       │             │       ▲
-                                       │             ▼       │ retract-and-replace
-                                       │         w_detector ─┘
-                                       │             │
-                                       │             ▼ (on trigger)
-                                       └──► re-inference ──► top-K
-                                            (synchronous, ~40 ms)
+mic → audio_capture → segmenter → letter_recognizer ──LETTER_RECOGNIZED──► decoder ──► spell_ui ──► speaker
 
-                                  early-commit-window event ─► decoder
-                                  end-of-word event         ─► decoder
-                                  button press              ─► spell_ui
+  letter_recognizer internals:
+    utterance PCM ─► first-pass inference ─► top-K ─┬─► W-trigger predicate (against own top-K history)
+                                                    │
+                       ┌────────────────────────────┘
+                       ▼ (on trigger; ~40 ms; 0 ms otherwise)
+            merge last 3 PCM ─► inference_run() ─► merged top-K
+                                                    │
+                       ┌────────────────────────────┘
+                       ▼
+            emit LETTER_RECOGNIZED with retract_count = 0 (normal/no-confirm)
+                                       or retract_count = 2 (confirmed W)
+
+  early-commit-window event ─► decoder
+  end-of-word event         ─► decoder
+  button press              ─► spell_ui
 ```
 
 ## Testing Decisions
@@ -178,8 +187,9 @@ A good test in this codebase exercises the *external behavior* of a `_core` modu
 
 ### Modules with host-side unit tests
 
-- **`decoder_core`** via `tools/decoder_replay/test_decoder_core.c`. Cases: clean spelling → exact resolution; one wrong top-1 with confusion-pair recovery; prefix-truncation (BAN/BANK) with each predicate clause failing in isolation; 1-edit insertion; 1-edit deletion; abstain on flat distribution; `MAX_LETTERS_PER_WORD` overflow → abstain; per-clause early-commit predicate coverage; **retract-and-replace** with the replaced sequence shorter than the buffer (count=3, buffer length 5) and longer (count=3, buffer length 3); retract-and-replace arriving after early-commit (logged-and-dropped path).
-- **`w_detector_core`** via `tools/w_detector_replay/test_w_detector_core.c`. Pure-C trigger logic, operating on synthetic top-K event sequences (no PCM, no real inference). Cases: three high-confidence non-W letters → no trigger; two low-conf + high-conf U → trigger fires; two high-conf + high-conf U → no trigger; two low-conf + high-conf non-U → no trigger; two low-conf + low-conf U → no trigger; boundary cases at each threshold; not-enough-history (only 1 prior event) → no trigger; consecutive triggers (W-W back to back) handled correctly.
+- **`decoder_core`** via `tools/decoder_replay/test_decoder_core.c`. Cases: clean spelling → exact resolution; one wrong top-1 with confusion-pair recovery; prefix-truncation (BAN/BANK) with each predicate clause failing in isolation; 1-edit insertion; 1-edit deletion; abstain on flat distribution; `MAX_LETTERS_PER_WORD` overflow → abstain; per-clause early-commit predicate coverage; **retract handling** — `LETTER_RECOGNIZED { retract_count = 2 }` arriving with the in-flight buffer length ≥ 2 correctly drops the two prior entries and appends `top_k`; `retract_count = 0` is the no-op common path and is exercised in every clean-spelling case.
+- **`w_detector_core`** via `tools/w_detector_replay/test_w_detector_core.c`. Pure-C trigger predicate, operating on synthetic top-K event sequences (no PCM, no real inference). Lives at `components/letter_recognizer/w_detector_core.{c,h}` as a sub-module of the recognizer; the host tool links it directly. Cases: three high-confidence non-W letters → no trigger; two low-conf + high-conf U → trigger fires; two high-conf + high-conf U → no trigger; two low-conf + high-conf non-U → no trigger; two low-conf + low-conf U → no trigger; boundary cases at each threshold; not-enough-history (only 1 prior event) → no trigger; consecutive triggers (W-W back to back) handled correctly.
+- **`inference_run(pcm) → top_k`** (the recognizer's pure signal pipeline) — host-testable in isolation against recorded WAVs once the host MFCC + TFLM build is set up. Not required for Phase 5; tracks against the existing Python reference per ADR-0004.
 - **`ui_core`** via host transition tests. Cases: every (state, event) pair → assert (next_state, action_list). Specific scenarios: cancel + re-arm from PLAYING; button-during-ARMED ignored; arm-timeout from ARMED → IDLE; EOW from SPELLING → RESOLVING; early-commit-window with predicate-met → RESOLVING; abstain from RESOLVING → IDLE with error chirp.
 - **`seg_core`** extended (existing test file). New cases: early-commit-window fires once per inter-letter gap; latch resets on next onset; window event ordering is always before EOW; window does not fire if min-silence not reached.
 
@@ -207,8 +217,8 @@ A good test in this codebase exercises the *external behavior* of a `_core` modu
 
 ## Further Notes
 
-- **ADR cross-references.** Aggressive early-commit: [ADR-0001](../adr/0001-aggressive-early-commit-decoder.md). Confusion matrix retained at α=0.15: [ADR-0002](../adr/0002-confusion-matrix-with-tts-trained-model.md). Fully-offline-production: [ADR-0003](../adr/0003-fully-offline-production-firmware.md). Python-reference tuning: [ADR-0004](../adr/0004-decoder-tuning-via-python-reference.md). W detection via inference results: [ADR-0005](../adr/0005-w-detection-via-inference-results.md).
+- **ADR cross-references.** Aggressive early-commit: [ADR-0001](../adr/0001-aggressive-early-commit-decoder.md). Confusion matrix retained at α=0.15: [ADR-0002](../adr/0002-confusion-matrix-with-tts-trained-model.md). Fully-offline-production: [ADR-0003](../adr/0003-fully-offline-production-firmware.md). Python-reference tuning: [ADR-0004](../adr/0004-decoder-tuning-via-python-reference.md). W-recovery inside the letter recognizer (variant 2 wire model): [ADR-0005](../adr/0005-w-detection-via-inference-results.md). Unified `LETTER_RECOGNIZED` event with optional retract count: [ADR-0006](../adr/0006-unified-letter-recognized-event.md).
 - **Domain glossary.** Domain language (utterance, letter, EOW, early-commit window, demo set vs QA set, top-K, etc.) is in `CONTEXT.md`. The "W detector" / "trigger" / "retract-and-replace" terminology is W-specific and confined to this feature; not added to the global glossary.
-- **Sequencing.** Recommended implementation order: (a) extend `seg_core` with the early-commit-window event + tests; (b) extend `letter_classifier` with the PCM ring; (c) build `w_detector_core` with synthetic-event tests; (d) build `decoder_core` (including retract-and-replace) with hand-crafted fixture tests; (e) build `ui_core` transition table with tests; (f) integrate IDF wrappers; (g) bench-test on hardware once Phase 0 mic + speaker bring-up is complete.
-- **Latency budget.** Worst-case user-perceived latency from last-letter-offset to word-playback-start under aggressive early-commit, full pipeline, no W in word: early-commit silence floor (500 ms) + predicate eval (~1 ms) + resolved tone (80 ms) + Opus decode (Phase 6, ~30–80 ms) + I2S TX warmup (~10 ms) ≈ 620–680 ms. With W in word: +40 ms re-inference, only if the U arrives early enough that re-inference completes before the silence floor expires (which is the common case). Status-quo full-EOW path: ~1300–1400 ms. Aggressive path saves ~700 ms typical.
+- **Sequencing.** Recommended implementation order: (a) **precursor** — load the 51 KB model into the `model` partition, drop `SPELL_TENSOR_ARENA_SIZE` to a measured value, flip the arena's heap cap to `MALLOC_CAP_INTERNAL`, and measure invoke time on hardware (the arena MUST live in SRAM — PSRAM access balloons inference latency past ADR-0001's 500 ms silence floor); (b) rename `letter_classifier` → `letter_recognizer` (component dir, headers, init calls in `app_main.c`, comments) and migrate `spell_events.h` to the unified `LETTER_RECOGNIZED` event per ADR-0006; (c) extend `seg_core` with the early-commit-window event + tests; (d) extend the recognizer with the internal PCM ring (no public access function); (e) add `w_detector_core` (pure-C trigger predicate sub-module of the recognizer) with synthetic-event tests; (f) integrate the W-recovery cycle into the recognizer (variant 2: hold U emission, merge-and-rerun, unified event emission, Kconfig bypass); (g) build `decoder_core` (single retract-aware letter-event handler) with hand-crafted fixture tests; (h) build `ui_core` transition table with tests; (i) integrate IDF wrappers; (j) bench-test on hardware once Phase 0 mic + speaker bring-up is complete.
+- **Latency budget.** Worst-case user-perceived latency from last-letter-offset to word-playback-start under aggressive early-commit, full pipeline, no W in word: early-commit silence floor (500 ms) + predicate eval (~1 ms) + resolved tone (80 ms) + Opus decode (Phase 6, ~30–80 ms) + I2S TX warmup (~10 ms) ≈ 620–680 ms. With W in word: the recognizer holds the U emission for ~40 ms during merge-and-rerun, but this happens during the inter-letter silence (well within the 500 ms floor), so it does not extend user-perceived latency in the common case. Status-quo full-EOW path: ~1300–1400 ms. Aggressive path saves ~700 ms typical. Note: budget assumes the TFLM arena lives in SRAM — see sequencing step (a).
 - **No issue tracker.** This PRD is filed locally because the repo has no GitHub remote. When a tracker is configured, this document migrates with the `needs-triage` label preserved.

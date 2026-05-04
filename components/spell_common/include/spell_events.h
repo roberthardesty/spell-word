@@ -5,8 +5,8 @@
  * Components that emit events declare the matching ESP_EVENT_DEFINE_BASE in
  * their .c/.cpp file. Consumers register handlers via:
  *
- *   esp_event_handler_register(SPELL_INFERENCE_EVENT,
- *                              SPELL_EVENT_LETTER_TOP_K,
+ *   esp_event_handler_register(SPELL_RECOGNIZER_EVENT,
+ *                              SPELL_EVENT_LETTER_RECOGNIZED,
  *                              handler, ctx);
  */
 
@@ -21,15 +21,23 @@ extern "C" {
 #endif
 
 // =============================================================================
-// Inference events — emitted by letter_classifier
+// Recognizer events — emitted by letter_recognizer (per ADR-0006)
 // =============================================================================
+//
+// One event type carries every per-utterance result. retract_count is 0 in
+// the common case (every clean utterance) and 2 only when the W-recovery
+// cycle (ADR-0005) has confirmed a multi-utterance W: the recognizer holds
+// the U emission, re-runs inference on merged PCM, and emits a single
+// LETTER_RECOGNIZED with retract_count=2 carrying the W top-K. The decoder's
+// letter-event handler is one code path: pop retract_count entries from its
+// in-flight buffer, push top_k.
 
-ESP_EVENT_DECLARE_BASE(SPELL_INFERENCE_EVENT);
+ESP_EVENT_DECLARE_BASE(SPELL_RECOGNIZER_EVENT);
 
 enum {
-    /// Top-K letter candidates produced by the DS-CNN for one utterance.
-    /// Payload: spell_letter_topk_event_t.
-    SPELL_EVENT_LETTER_TOP_K = 1,
+    /// One letter-position's top-K evidence (with optional retract count for
+    /// W-recovery). Payload: spell_letter_recognized_event_t.
+    SPELL_EVENT_LETTER_RECOGNIZED = 1,
 };
 
 typedef struct {
@@ -38,9 +46,16 @@ typedef struct {
 } spell_letter_candidate_t;
 
 typedef struct {
-    spell_letter_candidate_t top_k[SPELL_LETTER_TOP_K];
+    spell_letter_candidate_t candidates[SPELL_LETTER_TOP_K];
     uint32_t                 invoke_ms;     ///< TFLM Invoke() wall-clock ms
-} spell_letter_topk_event_t;
+} spell_letter_top_k_t;
+
+typedef struct {
+    spell_letter_top_k_t top_k;
+    /// Drop this many prior in-flight entries before appending top_k. 0 in
+    /// the common case; 2 when W-recovery has confirmed a multi-utterance W.
+    uint8_t              retract_count;
+} spell_letter_recognized_event_t;
 
 // =============================================================================
 // Segmenter events — emitted by segmenter
@@ -145,24 +160,8 @@ typedef struct {
     spell_ui_state_t to_state;
 } spell_ui_state_transition_event_t;
 
-// =============================================================================
-// W-detector events — emitted by w_detector
-// =============================================================================
-
-ESP_EVENT_DECLARE_BASE(SPELL_W_DETECTOR_EVENT);
-
-enum {
-    /// Tells the decoder to pop the most recent retract_count top-K events
-    /// from its in-flight buffer and push the replacement event in their
-    /// place (PRD 0001 §"Decoder retract-and-replace"). Payload:
-    /// spell_retract_and_replace_event_t.
-    SPELL_EVENT_RETRACT_AND_REPLACE = 1,
-};
-
-typedef struct {
-    uint8_t                   retract_count; ///< usually 3 (the W trigger pattern)
-    spell_letter_topk_event_t replacement;   ///< re-inference top-K (a confident W)
-} spell_retract_and_replace_event_t;
+// W-recovery is folded into LETTER_RECOGNIZED (retract_count=2) per ADR-0006.
+// No separate SPELL_W_DETECTOR_EVENT base exists.
 
 #ifdef __cplusplus
 }  // extern "C"

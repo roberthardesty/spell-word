@@ -30,6 +30,10 @@ The K most probable letters (with their softmax probabilities) for one utterance
 **Confusion matrix (M)**:
 The 26×26 matrix where `M[j, i] = P(true=i | top1=j)`, computed upstream from held-out evaluation data. Mixed into the per-letter posterior with weight α (`SPELL_DECODER_ALPHA`).
 
+**Letter recognizer**:
+The module that owns audio-to-evidence for a single letter position. Receives segmented **utterance** PCM, runs first-pass inference (DS-CNN → **top-K**), maintains a short PCM ring and top-K history for W-recovery, and emits per-utterance top-K events plus retract-and-replace events when the W-recovery cycle confirms a multi-utterance W. Does not commit to a **letter** symbol — that is the **decoder**'s job.
+_Avoid_: "letter classifier" (the module does more than classify; it recovers via re-inference on merged PCM).
+
 **Word**:
 A multi-letter target spelled by the user. Resolved against the dictionary by the decoder.
 

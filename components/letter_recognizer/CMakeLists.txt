@@ -1,7 +1,7 @@
 idf_component_register(
     SRCS
         "feat_extract.c"
-        "inference.cpp"
+        "letter_recognizer.cpp"
     INCLUDE_DIRS
         "include"
     REQUIRES

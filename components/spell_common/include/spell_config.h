@@ -192,7 +192,7 @@
 #define SPELL_W_DETECT_LOW_CONF_THRESHOLD   0.40f  // each of the prior two below this
 #define SPELL_W_DETECT_CONFIRM_THRESHOLD    0.70f  // re-inference top-1 'W' must clear this
 
-// PCM ring depth in letter_classifier: 3 candidate utterances in the detection
+// PCM ring depth in letter_recognizer: 3 candidate utterances in the detection
 // window plus 1 currently being processed.
 #define SPELL_W_DETECT_PCM_RING_DEPTH       4
 

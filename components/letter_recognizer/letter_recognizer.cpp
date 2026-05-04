@@ -1,6 +1,6 @@
 /**
- * @file inference.cpp
- * @brief DS-CNN spoken-letter classifier driving SPELL_EVENT_LETTER_TOP_K.
+ * @file letter_recognizer.cpp
+ * @brief Letter recognizer task driving SPELL_EVENT_LETTER_RECOGNIZED.
  *
  * Adapted from the EARS POC's inference.cpp. The TFLM scaffolding (model
  * partition load, hot-reload, tensor arena in PSRAM, per-tensor int8
@@ -8,7 +8,7 @@
  * Three things change for Spell-Word:
  *
  *   1. I/O inversion. EARS subscribed to audio_capture and pulled
- *      continuous 1-second windows. Here, the inference task waits on a
+ *      continuous 1-second windows. Here, the recognizer task waits on an
  *      utterance queue fed by the segmenter, and the segmenter owns the
  *      audio_capture subscription. The arrangement allows VAD-aligned
  *      windows instead of fixed-rate ones.
@@ -39,7 +39,7 @@
  *     pipeline's segment-curation tool (SPELL_ENERGY_GATE_DB).
  */
 
-#include "inference.h"
+#include "letter_recognizer.h"
 #include "feat_extract.h"
 #include "spell_config.h"
 #include "spell_events.h"
@@ -66,16 +66,16 @@
 // NOTE: esp-nn SIMD kernels (Conv2D, DepthwiseConv2D, etc.) are linked
 // transitively through esp-tflite-micro — no explicit #include needed.
 
-static const char *TAG = "inference";
+static const char *TAG = "recognizer";
 
 // ── Event base definition ─────────────────────────────────────────────
-ESP_EVENT_DEFINE_BASE(SPELL_INFERENCE_EVENT);
+ESP_EVENT_DEFINE_BASE(SPELL_RECOGNIZER_EVENT);
 
-// ── Utterance queue (segmenter → inference) ───────────────────────────
+// ── Utterance queue (segmenter → recognizer) ──────────────────────────
 //
 // Ownership: producer (segmenter) heap_caps_mallocs the pcm buffer in
-// PSRAM and submits via inference_submit_utterance(). On successful
-// enqueue, ownership transfers to the inference task, which heap_caps_frees
+// PSRAM and submits via letter_recognizer_submit_utterance(). On successful
+// enqueue, ownership transfers to the recognizer task, which heap_caps_frees
 // after processing. On failed enqueue (queue full, pre-init), the caller
 // retains ownership.
 //
@@ -108,9 +108,9 @@ static float *s_features = nullptr;
 
 // ── Task + stats ──────────────────────────────────────────────────────
 //
-// Stat counters are written from inference_task and the segmenter task
-// (s_drop_count, via inference_submit_utterance) and read from any task
-// via the public getters. std::atomic<uint32_t> with relaxed semantics
+// Stat counters are written from the recognizer task and the segmenter task
+// (s_drop_count, via letter_recognizer_submit_utterance) and read from any
+// task via the public getters. std::atomic<uint32_t> with relaxed semantics
 // gives us correct cross-task increments without forcing memory fences;
 // volatile alone wouldn't prevent torn reads on a 32-bit MCU bus.
 static TaskHandle_t            s_task                  = nullptr;
@@ -312,10 +312,10 @@ static float window_rms_dbfs(const int16_t *pcm, int n_samples)
 // Inference task
 // =====================================================================
 
-static void inference_task(void *arg)
+static void recognizer_task(void *arg)
 {
     (void)arg;
-    ESP_LOGI(TAG, "inference_task running on core %d", xPortGetCoreID());
+    ESP_LOGI(TAG, "recognizer_task running on core %d", xPortGetCoreID());
 
     // WDT for Core 1 IDLE is disabled via sdkconfig
     // (CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n) so Invoke() can run for
@@ -462,9 +462,13 @@ static void inference_task(void *arg)
         }
 
         // ── Top-K selection + event post ─────────────────────────────
-        spell_letter_topk_event_t evt;
-        top_k_select(probs, 26, evt.top_k, SPELL_LETTER_TOP_K);
-        evt.invoke_ms = (uint32_t)dt_invoke_ms;
+        // retract_count is always 0 here; the W-recovery cycle (ADR-0005)
+        // is the only path that sets a non-zero value, and it lands in a
+        // later slice (#30) by interposing on this same emission point.
+        spell_letter_recognized_event_t evt;
+        top_k_select(probs, 26, evt.top_k.candidates, SPELL_LETTER_TOP_K);
+        evt.top_k.invoke_ms = (uint32_t)dt_invoke_ms;
+        evt.retract_count   = 0;
 
         uint32_t n_inf = s_inference_count.fetch_add(
                               1, std::memory_order_relaxed) + 1;
@@ -475,13 +479,16 @@ static void inference_task(void *arg)
         if (n_inf <= 3 || n_inf % 5 == 0) {
             ESP_LOGI(TAG, "#%" PRIu32 " %c=%.2f %c=%.2f %c=%.2f (%dms)",
                      n_inf,
-                     'A' + evt.top_k[0].letter_index, evt.top_k[0].probability,
-                     'A' + evt.top_k[1].letter_index, evt.top_k[1].probability,
-                     'A' + evt.top_k[2].letter_index, evt.top_k[2].probability,
+                     'A' + evt.top_k.candidates[0].letter_index,
+                     evt.top_k.candidates[0].probability,
+                     'A' + evt.top_k.candidates[1].letter_index,
+                     evt.top_k.candidates[1].probability,
+                     'A' + evt.top_k.candidates[2].letter_index,
+                     evt.top_k.candidates[2].probability,
                      dt_invoke_ms);
         }
 
-        esp_event_post(SPELL_INFERENCE_EVENT, SPELL_EVENT_LETTER_TOP_K,
+        esp_event_post(SPELL_RECOGNIZER_EVENT, SPELL_EVENT_LETTER_RECOGNIZED,
                        &evt, sizeof(evt), 0);
 
         heap_caps_free(utt.pcm);
@@ -492,10 +499,10 @@ static void inference_task(void *arg)
 // Public API
 // =====================================================================
 
-esp_err_t inference_init(void)
+esp_err_t letter_recognizer_init(void)
 {
     if (s_utterance_q) {
-        ESP_LOGW(TAG, "inference_init() called twice — ignoring");
+        ESP_LOGW(TAG, "letter_recognizer_init() called twice — ignoring");
         return ESP_OK;
     }
 
@@ -517,16 +524,16 @@ esp_err_t inference_init(void)
     if (load_model_from_partition()) {
         if (setup_interpreter()) {
             s_model_loaded = true;
-            ESP_LOGI(TAG, "letter classifier ready (top-K=%d)",
+            ESP_LOGI(TAG, "letter recognizer ready (top-K=%d)",
                      SPELL_LETTER_TOP_K);
         } else {
-            ESP_LOGW(TAG, "interpreter setup failed — inference disabled");
+            ESP_LOGW(TAG, "interpreter setup failed — recognition disabled");
         }
     } else {
-        ESP_LOGW(TAG, "no model in flash — inference disabled until OTA");
+        ESP_LOGW(TAG, "no model in flash — recognition disabled until OTA");
     }
 
-    // ── Utterance queue (segmenter → inference) ──────────────────────
+    // ── Utterance queue (segmenter → recognizer) ─────────────────────
     s_utterance_q = xQueueCreate(SPELL_INFERENCE_QUEUE_DEPTH,
                                  sizeof(utterance_t));
     if (!s_utterance_q) {
@@ -534,10 +541,10 @@ esp_err_t inference_init(void)
         return ESP_ERR_NO_MEM;
     }
 
-    // ── Spawn inference task on Core 1 ───────────────────────────────
+    // ── Spawn recognizer task on Core 1 ──────────────────────────────
     BaseType_t r = xTaskCreatePinnedToCore(
-        inference_task,
-        "inference",
+        recognizer_task,
+        "recognizer",
         SPELL_INFERENCE_TASK_STACK,
         nullptr,
         5,          // priority — below capture (10), above decoder (4)
@@ -549,12 +556,12 @@ esp_err_t inference_init(void)
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "inference task spawned on core 1 (model %s)",
+    ESP_LOGI(TAG, "recognizer task spawned on core 1 (model %s)",
              s_model_loaded ? "active" : "pending OTA");
     return ESP_OK;
 }
 
-esp_err_t inference_submit_utterance(int16_t *pcm, size_t n_samples)
+esp_err_t letter_recognizer_submit_utterance(int16_t *pcm, size_t n_samples)
 {
     if (!s_utterance_q) return ESP_ERR_INVALID_STATE;
     if (!pcm || n_samples == 0) return ESP_ERR_INVALID_ARG;
@@ -572,22 +579,22 @@ esp_err_t inference_submit_utterance(int16_t *pcm, size_t n_samples)
     return ESP_OK;
 }
 
-esp_err_t inference_reload_model(void)
+esp_err_t letter_recognizer_reload_model(void)
 {
     s_reload_requested.store(true, std::memory_order_relaxed);
     ESP_LOGI(TAG, "model reload requested — will apply on next utterance");
     return ESP_OK;
 }
 
-uint32_t inference_get_count(void) {
+uint32_t letter_recognizer_get_count(void) {
     return s_inference_count.load(std::memory_order_relaxed);
 }
-uint32_t inference_get_gate_skip_count(void) {
+uint32_t letter_recognizer_get_gate_skip_count(void) {
     return s_gate_skip_count.load(std::memory_order_relaxed);
 }
-uint32_t inference_get_drop_count(void) {
+uint32_t letter_recognizer_get_drop_count(void) {
     return s_drop_count.load(std::memory_order_relaxed);
 }
-uint32_t inference_get_invalid_drop_count(void) {
+uint32_t letter_recognizer_get_invalid_drop_count(void) {
     return s_invalid_drop_count.load(std::memory_order_relaxed);
 }

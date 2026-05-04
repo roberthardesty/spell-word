@@ -6,7 +6,7 @@ idf_component_register(
     REQUIRES
         spell_common
         audio_capture
-        letter_classifier
+        letter_recognizer
         segmenter
         spell_ui
         audio_dump

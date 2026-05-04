@@ -4,7 +4,7 @@
  *
  * Subscribes to audio_capture for a stream of int16 PCM frames, runs a
  * frame-rate energy VAD, emits per-letter utterance windows to the
- * letter_classifier's queue, and posts SPELL_EVENT_END_OF_WORD on
+ * letter_recognizer's queue, and posts SPELL_EVENT_END_OF_WORD on
  * sustained silence.
  *
  * Bring-up state (Day 3): basic onset/offset hysteresis only. No pre-roll

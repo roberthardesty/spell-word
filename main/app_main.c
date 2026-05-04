@@ -13,7 +13,7 @@
  *   3. check_factory_reset()  — hold BOOT for 5 s at boot to erase NVS.
  *                               Useful as a "model OTA recovery" fallback.
  *   4. audio_capture_init()   — configures I2S RX, zeros sub table.
- *   5. inference_init()       — log-mel + TFLM + utterance queue.
+ *   5. letter_recognizer_init() — MFCC + TFLM + utterance queue.
  *   6. segmenter_init()       — subscribes to audio_capture, spawns task.
  *   7. audio_capture_start()  — enables I2S, spawns capture task.
  *                               After this call no further subscribers
@@ -43,7 +43,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "inference.h"
+#include "letter_recognizer.h"
 #include "nvs_flash.h"
 #include "sdkconfig.h"
 #include "segmenter.h"
@@ -140,23 +140,27 @@ static void check_factory_reset(void)
 }
 
 // ---------------------------------------------------------------------------
-// Day-3 bring-up: log every top-K event from the inference task. This is
-// the equivalent of EARS' bark-event handler, for letters. Replaced by the
-// decoder subscription once Phase 5 lands.
+// Day-3 bring-up: log every LETTER_RECOGNIZED event from the recognizer.
+// This is the equivalent of EARS' bark-event handler, for letters. Replaced
+// by the decoder subscription once Phase 5 lands.
 // ---------------------------------------------------------------------------
-static void on_letter_top_k(void *arg, esp_event_base_t base,
-                            int32_t event_id, void *event_data)
+static void on_letter_recognized(void *arg, esp_event_base_t base,
+                                 int32_t event_id, void *event_data)
 {
     (void)arg; (void)base; (void)event_id;
-    const spell_letter_topk_event_t *evt = (const spell_letter_topk_event_t *)event_data;
+    const spell_letter_recognized_event_t *evt =
+        (const spell_letter_recognized_event_t *)event_data;
+    const spell_letter_candidate_t *c = evt->top_k.candidates;
 
-    ESP_LOGI(TAG, "TOPK  %c=%.2f  %c=%.2f  %c=%.2f  %c=%.2f  %c=%.2f  (%" PRIu32 "ms)",
-             'A' + evt->top_k[0].letter_index, evt->top_k[0].probability,
-             'A' + evt->top_k[1].letter_index, evt->top_k[1].probability,
-             'A' + evt->top_k[2].letter_index, evt->top_k[2].probability,
-             'A' + evt->top_k[3].letter_index, evt->top_k[3].probability,
-             'A' + evt->top_k[4].letter_index, evt->top_k[4].probability,
-             evt->invoke_ms);
+    ESP_LOGI(TAG, "LREC  %c=%.2f  %c=%.2f  %c=%.2f  %c=%.2f  %c=%.2f  "
+                  "(retract=%u, %" PRIu32 "ms)",
+             'A' + c[0].letter_index, c[0].probability,
+             'A' + c[1].letter_index, c[1].probability,
+             'A' + c[2].letter_index, c[2].probability,
+             'A' + c[3].letter_index, c[3].probability,
+             'A' + c[4].letter_index, c[4].probability,
+             (unsigned)evt->retract_count,
+             evt->top_k.invoke_ms);
 }
 
 static void on_end_of_word(void *arg, esp_event_base_t base,
@@ -196,21 +200,22 @@ void app_main(void)
     // Default event loop — required for esp_event_post / handler register.
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    // Bring-up subscriptions. The decoder will replace the TOP_K handler
-    // in Phase 5; the EOW handler stays as-is and just changes consumer.
+    // Bring-up subscriptions. The decoder will replace the LETTER_RECOGNIZED
+    // handler in Phase 5; the EOW handler stays as-is and just changes
+    // consumer.
     ESP_ERROR_CHECK(esp_event_handler_register(
-        SPELL_INFERENCE_EVENT, SPELL_EVENT_LETTER_TOP_K,
-        on_letter_top_k, NULL));
+        SPELL_RECOGNIZER_EVENT, SPELL_EVENT_LETTER_RECOGNIZED,
+        on_letter_recognized, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(
         SPELL_SEGMENTER_EVENT, SPELL_EVENT_END_OF_WORD,
         on_end_of_word, NULL));
 
     // --- Audio pipeline ----------------------------------------------------
     ESP_ERROR_CHECK(audio_capture_init());
-    ESP_ERROR_CHECK(inference_init());      // log-mel + TFLM + utterance queue
-    ESP_ERROR_CHECK(segmenter_init());      // subscribes to audio_capture
-    ESP_ERROR_CHECK(audio_dump_init(10));   // 10 s ring for VAD-failure capture
-    ESP_ERROR_CHECK(audio_capture_start()); // I2S enabled; data flows
+    ESP_ERROR_CHECK(letter_recognizer_init()); // MFCC + TFLM + utterance queue
+    ESP_ERROR_CHECK(segmenter_init());         // subscribes to audio_capture
+    ESP_ERROR_CHECK(audio_dump_init(10));      // 10 s ring for VAD-failure capture
+    ESP_ERROR_CHECK(audio_capture_start());    // I2S enabled; data flows
 
     // For now, audio_dump_emit_b64() has no firmware-side trigger — call it
     // from a debug hook (button handler, console command, decoder-abstain

@@ -11,9 +11,10 @@
  *   - Pre-roll ring buffer (~6.4 KB, 200 ms @ 16 kHz): allocated once in
  *     PSRAM during init; lifetime equals the firmware run.
  *   - Accumulator (sized for pre-roll + max-letter): allocated once in PSRAM.
- *   - Per-utterance PSRAM buffer for inference: heap_caps_malloc'd at emit
- *     time, ownership transfers to the inference task on successful submit
- *     (it heap_caps_frees after processing). On submit failure, freed here.
+ *   - Per-utterance PSRAM buffer for the recognizer: heap_caps_malloc'd at
+ *     emit time, ownership transfers to the recognizer task on successful
+ *     submit (it heap_caps_frees after processing). On submit failure, freed
+ *     here.
  */
 
 #include "segmenter.h"
@@ -34,7 +35,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#include "inference.h"
+#include "letter_recognizer.h"
 
 static const char *TAG = "segmenter";
 
@@ -115,7 +116,7 @@ static void dispatch_letter(const seg_event_t *evt, bool is_force_split)
         memcpy(out, &evt->pcm[start], win * sizeof(int16_t));
     }
 
-    esp_err_t err = inference_submit_utterance(out, win);
+    esp_err_t err = letter_recognizer_submit_utterance(out, win);
     if (err != ESP_OK) {
         heap_caps_free(out);
         return;

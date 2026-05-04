@@ -3,7 +3,7 @@
  *
  * Superseded by feat_extract.h. The Spell-Word DS-CNN consumes a 3-channel
  * MFCC + Δ + ΔΔ tensor, not raw log-mel; the front-end was rebuilt
- * accordingly. See components/letter_classifier/feat_extract.{c,h} for
+ * accordingly. See components/letter_recognizer/feat_extract.{c,h} for
  * the live implementation.
  *
  * This header is kept in the tree only to preserve git history. It is no
