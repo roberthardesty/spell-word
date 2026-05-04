@@ -1,0 +1,6 @@
+# Host-build artifacts. These are platform- and arch-specific and must NOT
+# be checked in — a Linux .o or ELF here will silently shadow the host's
+# Make output (timestamps look up-to-date but the binary won't execute).
+*.o
+decoder_replay
+test_decoder_core

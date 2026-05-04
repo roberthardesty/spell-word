@@ -6,8 +6,9 @@ managed_components/
 dependencies.lock
 
 # --- Host-side build output ---
-# segmenter_core.o gets dropped next to the source by tools/segmenter_replay/Makefile.
+# core .o files get dropped next to the source by tools/<name>_replay/Makefile.
 components/segmenter/*.o
+components/decoder/*.o
 
 # --- Editor / OS ---
 .cache/
