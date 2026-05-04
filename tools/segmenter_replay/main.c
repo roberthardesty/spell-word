@@ -39,6 +39,7 @@
 #define DEF_OFF_FRAMES      5
 #define DEF_MIN_LETTER_MS   150
 #define DEF_MAX_LETTER_MS   800
+#define DEF_EARLY_MS        500
 #define DEF_EOW_MS          1200
 #define DEF_PREROLL_MS      200
 
@@ -57,6 +58,7 @@ static void print_usage(const char *argv0)
         "  --off-frames N       sub-off frames to confirm (default %d)\n"
         "  --min-letter MS      reject below this duration (default %d)\n"
         "  --max-letter MS      force-split above this (default %d)\n"
+        "  --early-commit MS    inter-letter silence to fire window (default %d)\n"
         "  --eow MS             end-of-word silence (default %d)\n"
         "  --preroll MS         pre-roll context (default %d)\n"
         "  --dump-letters DIR   write each utterance as DIR/letter_NNN.wav\n"
@@ -64,7 +66,8 @@ static void print_usage(const char *argv0)
         "  --help               this message\n",
         argv0,
         DEF_ON_DBFS, DEF_OFF_DBFS, DEF_EMA_ALPHA_X100, DEF_OFF_FRAMES,
-        DEF_MIN_LETTER_MS, DEF_MAX_LETTER_MS, DEF_EOW_MS, DEF_PREROLL_MS);
+        DEF_MIN_LETTER_MS, DEF_MAX_LETTER_MS, DEF_EARLY_MS, DEF_EOW_MS,
+        DEF_PREROLL_MS);
 }
 
 static int ms_to_frames(int ms) {
@@ -79,6 +82,7 @@ int main(int argc, char **argv)
     int   off_frames     = DEF_OFF_FRAMES;
     int   min_letter_ms  = DEF_MIN_LETTER_MS;
     int   max_letter_ms  = DEF_MAX_LETTER_MS;
+    int   early_ms       = DEF_EARLY_MS;
     int   eow_ms         = DEF_EOW_MS;
     int   preroll_ms     = DEF_PREROLL_MS;
     const char *dump_dir = NULL;
@@ -93,6 +97,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--off-frames")   && i+1<argc) off_frames     = atoi(argv[++i]);
         else if (!strcmp(a, "--min-letter")   && i+1<argc) min_letter_ms  = atoi(argv[++i]);
         else if (!strcmp(a, "--max-letter")   && i+1<argc) max_letter_ms  = atoi(argv[++i]);
+        else if (!strcmp(a, "--early-commit") && i+1<argc) early_ms       = atoi(argv[++i]);
         else if (!strcmp(a, "--eow")          && i+1<argc) eow_ms         = atoi(argv[++i]);
         else if (!strcmp(a, "--preroll")      && i+1<argc) preroll_ms     = atoi(argv[++i]);
         else if (!strcmp(a, "--dump-letters") && i+1<argc) dump_dir       = argv[++i];
@@ -129,6 +134,7 @@ int main(int argc, char **argv)
         .off_frames          = off_frames,
         .min_letter_frames   = ms_to_frames(min_letter_ms),
         .max_letter_frames   = ms_to_frames(max_letter_ms),
+        .early_commit_frames = ms_to_frames(early_ms),
         .eow_frames          = ms_to_frames(eow_ms),
         .preroll             = preroll,
         .preroll_samples     = preroll_samples,
@@ -146,9 +152,10 @@ int main(int argc, char **argv)
     printf("file:  %s (%.3f s, %zu samples)\n",
            input_wav, (double)n / SAMPLE_RATE, n);
     printf("vad:   on=%.1f off=%.1f ema=%d off_frames=%d "
-           "min_letter=%dms max_letter=%dms eow=%dms preroll=%dms\n",
+           "min_letter=%dms max_letter=%dms early_commit=%dms eow=%dms "
+           "preroll=%dms\n",
            on_dbfs, off_dbfs, ema_alpha_x100, off_frames,
-           min_letter_ms, max_letter_ms, eow_ms, preroll_ms);
+           min_letter_ms, max_letter_ms, early_ms, eow_ms, preroll_ms);
 
     int letter_idx = 0;
     int total_frames = (int)(n / FRAME_SAMPLES);
@@ -200,6 +207,11 @@ int main(int argc, char **argv)
             if (!quiet) {
                 printf("[%6d ms] END-OF-WORD (letters_so_far=%u)\n",
                        t_ms, evt.letters_in_word);
+            }
+            break;
+        case SEG_EVT_EARLY_COMMIT_WINDOW:
+            if (!quiet) {
+                printf("[%6d ms] early-commit window\n", t_ms);
             }
             break;
         }

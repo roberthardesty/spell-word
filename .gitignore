@@ -10,6 +10,7 @@ dependencies.lock
 components/segmenter/*.o
 
 # --- Editor / OS ---
+.cache/
 .DS_Store
 .idea/
 .vscode/

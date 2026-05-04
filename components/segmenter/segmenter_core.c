@@ -116,11 +116,14 @@ static void enter_letter_state(seg_state_t *s, const int16_t *frame, int n,
     s->letter_onset_in_accum = s->accum_len;
     accum_append(s, frame, n);
 
-    s->state                = SEG_STATE_IN_LETTER;
-    s->letter_frames        = 1;
-    s->silent_frames_offset = 0;
-    s->silent_frames_eow    = 0;
-    s->letter_peak_dbfs     = ema;
+    s->state                     = SEG_STATE_IN_LETTER;
+    s->letter_frames             = 1;
+    s->silent_frames_offset      = 0;
+    s->silent_frames_eow         = 0;
+    s->letter_peak_dbfs          = ema;
+    // Reset the early-commit latch so the next inter-letter silence cycle
+    // can fire its own window event.
+    s->early_commit_window_fired = false;
 }
 
 static void clear_letter_state(seg_state_t *s)
@@ -145,6 +148,10 @@ int seg_init(seg_state_t *state, const seg_config_t *cfg)
     if (cfg->min_letter_frames < 0)     return -1;
     if (cfg->max_letter_frames <= cfg->min_letter_frames) return -1;
     if (cfg->eow_frames        <= 0)    return -1;
+    if (cfg->early_commit_frames <= 0)  return -1;
+    // early_commit_frames < eow_frames guarantees the window event always
+    // fires before EOW in the same silence stretch.
+    if (cfg->early_commit_frames >= cfg->eow_frames) return -1;
     if (!cfg->preroll || cfg->preroll_samples <= 0)   return -1;
     if (!cfg->accum   || cfg->accum_capacity  < cfg->frame_samples) return -1;
     if (cfg->on_dbfs <= cfg->off_dbfs)  return -1;  // hysteresis must have margin
@@ -160,15 +167,16 @@ int seg_init(seg_state_t *state, const seg_config_t *cfg)
 void seg_reset(seg_state_t *state)
 {
     if (!state) return;
-    state->state                 = SEG_STATE_IDLE;
-    state->word_in_flight        = false;
-    state->silent_frames_offset  = 0;
-    state->silent_frames_eow     = 0;
-    state->letter_frames         = 0;
-    state->ema_dbfs              = -100.0f;
-    state->accum_len             = 0;
-    state->letter_onset_in_accum = 0;
-    state->letter_peak_dbfs      = -100.0f;
+    state->state                     = SEG_STATE_IDLE;
+    state->word_in_flight            = false;
+    state->early_commit_window_fired = false;
+    state->silent_frames_offset      = 0;
+    state->silent_frames_eow         = 0;
+    state->letter_frames             = 0;
+    state->ema_dbfs                  = -100.0f;
+    state->accum_len                 = 0;
+    state->letter_onset_in_accum     = 0;
+    state->letter_peak_dbfs          = -100.0f;
     // Pre-roll is intentionally preserved across resets.
 }
 
@@ -207,12 +215,22 @@ seg_event_t seg_process_frame(seg_state_t *s, const int16_t *frame, int n)
             // Onset.
             enter_letter_state(s, frame, n, ema);
         } else if (s->word_in_flight) {
-            if (++s->silent_frames_eow >= s->cfg.eow_frames) {
-                evt.kind            = SEG_EVT_END_OF_WORD;
-                evt.letters_in_word = s->total_letters_emitted;
+            s->silent_frames_eow++;
+            // Early-commit window fires once per inter-letter silence cycle,
+            // strictly before EOW (guaranteed by seg_init's
+            // early_commit_frames < eow_frames check). Latch resets in
+            // enter_letter_state on the next onset.
+            if (!s->early_commit_window_fired
+                && s->silent_frames_eow >= s->cfg.early_commit_frames) {
+                evt.kind = SEG_EVT_EARLY_COMMIT_WINDOW;
+                s->early_commit_window_fired = true;
+            } else if (s->silent_frames_eow >= s->cfg.eow_frames) {
+                evt.kind                     = SEG_EVT_END_OF_WORD;
+                evt.letters_in_word          = s->total_letters_emitted;
                 s->total_words_completed++;
-                s->word_in_flight   = false;
-                s->silent_frames_eow = 0;
+                s->word_in_flight            = false;
+                s->silent_frames_eow         = 0;
+                s->early_commit_window_fired = false;
             }
         }
         break;

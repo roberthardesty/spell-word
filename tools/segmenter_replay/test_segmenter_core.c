@@ -52,21 +52,41 @@
     } \
 } while (0)
 
+#define ASSERT_LT_INT(actual, bound, msg) do { \
+    int _a = (int)(actual), _b = (int)(bound); \
+    if (!(_a < _b)) { \
+        fprintf(stderr, "FAIL [%s]: %s\n  got %d, expected < %d\n", \
+                __func__, (msg), _a, _b); \
+        exit(1); \
+    } \
+} while (0)
+
 // Counters incremented from a callback-style event observer, so each test
 // can declare what it expects without fishing through a returned-event log.
+//
+// events_seq increments on every non-NONE event; first_*_seq capture the
+// sequence number at which a given event was first observed (0 = never).
+// This lets tests assert relative ordering between events (e.g. early-commit
+// window strictly before end-of-word).
 typedef struct {
     int  letters_emitted;
     int  letters_rejected;
     int  force_splits;
     int  end_of_words;
+    int  early_commits;
+    int  events_seq;
+    int  first_early_commit_seq;
+    int  first_eow_seq;
     int  last_letter_duration_ms;
     float last_letter_peak_dbfs;
 } obs_t;
 
 static void obs_observe(obs_t *o, const seg_event_t *evt)
 {
+    if (evt->kind == SEG_EVT_NONE) return;
+    o->events_seq++;
+
     switch (evt->kind) {
-    case SEG_EVT_NONE: break;
     case SEG_EVT_LETTER_EMITTED:
         o->letters_emitted++;
         o->last_letter_duration_ms = evt->duration_ms;
@@ -80,7 +100,14 @@ static void obs_observe(obs_t *o, const seg_event_t *evt)
         break;
     case SEG_EVT_END_OF_WORD:
         o->end_of_words++;
+        if (o->first_eow_seq == 0) o->first_eow_seq = o->events_seq;
         break;
+    case SEG_EVT_EARLY_COMMIT_WINDOW:
+        o->early_commits++;
+        if (o->first_early_commit_seq == 0) o->first_early_commit_seq = o->events_seq;
+        break;
+    case SEG_EVT_NONE:
+        break;  // unreachable; handled above
     }
 }
 
@@ -120,6 +147,7 @@ static void fixture_init(fixture_t *fx)
         .off_frames          = 5,
         .min_letter_frames   = ms_to_frames(150),
         .max_letter_frames   = ms_to_frames(800),
+        .early_commit_frames = ms_to_frames(500),
         .eow_frames          = ms_to_frames(1200),
         .preroll             = fx->preroll,
         .preroll_samples     = preroll_samples,
@@ -363,6 +391,115 @@ static void test_invalid_config_rejected(void)
     rc = seg_init(&fx.state, &fx.cfg);
     ASSERT_GE_INT(0, rc + 1, "seg_init should reject max <= min");
 
+    // Restore + try early_commit_frames >= eow_frames (would break the
+    // "window before EOW" ordering guarantee).
+    fx.cfg.min_letter_frames   = ms_to_frames(150);
+    fx.cfg.max_letter_frames   = ms_to_frames(800);
+    fx.cfg.early_commit_frames = fx.cfg.eow_frames;
+    rc = seg_init(&fx.state, &fx.cfg);
+    ASSERT_GE_INT(0, rc + 1,
+                  "seg_init should reject early_commit_frames >= eow_frames");
+
+    // Restore + try early_commit_frames == 0.
+    fx.cfg.early_commit_frames = 0;
+    rc = seg_init(&fx.state, &fx.cfg);
+    ASSERT_GE_INT(0, rc + 1,
+                  "seg_init should reject early_commit_frames == 0");
+
+    fixture_destroy(&fx);
+    printf("PASS: %s\n", __func__);
+}
+
+// ---------------------------------------------------------------------------
+// Early-commit window tests (Vikunja #19)
+// ---------------------------------------------------------------------------
+
+static void test_early_commit_window_fires_once_per_gap(void)
+{
+    // One letter, then enough silence to clear the 500 ms early-commit
+    // threshold but stay well below the 1200 ms EOW. The window event fires
+    // exactly once even as silence keeps accumulating — the latch holds.
+    fixture_t fx; fixture_init(&fx); fixture_apply(&fx);
+    obs_t obs = {0};
+
+    run_ms(&fx.state, &obs, 100,  fill_silent_ctx,    NULL);
+    run_ms(&fx.state, &obs, 250,  fill_sine_loud_ctx, NULL);
+    run_ms(&fx.state, &obs, 1000, fill_silent_ctx,    NULL);
+
+    ASSERT_EQ_INT(obs.letters_emitted, 1, "expected exactly 1 letter");
+    ASSERT_EQ_INT(obs.early_commits,   1, "expected exactly 1 early-commit window");
+    ASSERT_EQ_INT(obs.end_of_words,    0, "EOW fired before its threshold");
+
+    fixture_destroy(&fx);
+    printf("PASS: %s\n", __func__);
+}
+
+static void test_early_commit_latch_resets_on_onset(void)
+{
+    // Two letters separated by a gap longer than the early-commit threshold
+    // but shorter than EOW. A window event must fire in each inter-letter
+    // gap — the latch resets on the next letter onset.
+    fixture_t fx; fixture_init(&fx); fixture_apply(&fx);
+    obs_t obs = {0};
+
+    run_ms(&fx.state, &obs, 100, fill_silent_ctx,    NULL);
+    run_ms(&fx.state, &obs, 250, fill_sine_loud_ctx, NULL);  // letter A
+    run_ms(&fx.state, &obs, 700, fill_silent_ctx,    NULL);  // > 500 ms
+
+    ASSERT_EQ_INT(obs.early_commits, 1,
+                  "first inter-letter gap should fire the window once");
+
+    run_ms(&fx.state, &obs, 250, fill_sine_loud_ctx, NULL);  // letter B
+    run_ms(&fx.state, &obs, 700, fill_silent_ctx,    NULL);  // > 500 ms
+
+    ASSERT_EQ_INT(obs.letters_emitted, 2, "expected 2 letters");
+    ASSERT_EQ_INT(obs.early_commits,   2,
+                  "latch should reset on onset and fire again in second gap");
+    ASSERT_EQ_INT(obs.end_of_words,    0, "EOW fired before its threshold");
+
+    fixture_destroy(&fx);
+    printf("PASS: %s\n", __func__);
+}
+
+static void test_early_commit_window_before_eow(void)
+{
+    // One letter then 1500 ms of silence — enough to fire both the window
+    // (500 ms) and EOW (1200 ms). The window event must precede EOW in the
+    // observed event stream.
+    fixture_t fx; fixture_init(&fx); fixture_apply(&fx);
+    obs_t obs = {0};
+
+    run_ms(&fx.state, &obs, 100,  fill_silent_ctx,    NULL);
+    run_ms(&fx.state, &obs, 250,  fill_sine_loud_ctx, NULL);
+    run_ms(&fx.state, &obs, 1500, fill_silent_ctx,    NULL);
+
+    ASSERT_EQ_INT(obs.early_commits, 1, "expected exactly 1 early-commit window");
+    ASSERT_EQ_INT(obs.end_of_words,  1, "expected exactly 1 EOW");
+    ASSERT_GE_INT(obs.first_early_commit_seq, 1, "early-commit window not observed");
+    ASSERT_GE_INT(obs.first_eow_seq,          1, "EOW not observed");
+    ASSERT_LT_INT(obs.first_early_commit_seq, obs.first_eow_seq,
+                  "early-commit window must be observed before EOW");
+
+    fixture_destroy(&fx);
+    printf("PASS: %s\n", __func__);
+}
+
+static void test_early_commit_no_fire_below_min_silence(void)
+{
+    // Inter-letter gap of 200 ms — well below the 500 ms early-commit
+    // threshold. No window event should fire during the gap.
+    fixture_t fx; fixture_init(&fx); fixture_apply(&fx);
+    obs_t obs = {0};
+
+    run_ms(&fx.state, &obs, 100, fill_silent_ctx,    NULL);
+    run_ms(&fx.state, &obs, 250, fill_sine_loud_ctx, NULL);  // letter A
+    run_ms(&fx.state, &obs, 200, fill_silent_ctx,    NULL);  // < 500 ms gap
+    run_ms(&fx.state, &obs, 250, fill_sine_loud_ctx, NULL);  // letter B
+
+    ASSERT_EQ_INT(obs.early_commits, 0,
+                  "window fired despite gap shorter than threshold");
+    ASSERT_EQ_INT(obs.end_of_words,  0, "no EOW expected here");
+
     fixture_destroy(&fx);
     printf("PASS: %s\n", __func__);
 }
@@ -381,6 +518,11 @@ int main(void)
     test_short_blip_rejected();
     test_eow_only_after_emission();
     test_max_letter_force_split();
+
+    test_early_commit_window_fires_once_per_gap();
+    test_early_commit_latch_resets_on_onset();
+    test_early_commit_window_before_eow();
+    test_early_commit_no_fire_below_min_silence();
 
     printf("\nAll tests passed.\n");
     return 0;

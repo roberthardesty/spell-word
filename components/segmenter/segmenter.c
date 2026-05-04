@@ -183,6 +183,13 @@ static void segmenter_task(void *arg)
                            &eow, sizeof(eow), 0);
             break;
         }
+
+        case SEG_EVT_EARLY_COMMIT_WINDOW:
+            ESP_LOGD(TAG, "early-commit window");
+            esp_event_post(SPELL_SEGMENTER_EVENT,
+                           SPELL_EVENT_EARLY_COMMIT_WINDOW,
+                           NULL, 0, 0);
+            break;
         }
     }
 }
@@ -222,6 +229,7 @@ esp_err_t segmenter_init(void)
         .off_frames          = SPELL_VAD_OFF_FRAMES,
         .min_letter_frames   = MS_TO_FRAMES(SPELL_VAD_MIN_LETTER_MS),
         .max_letter_frames   = MS_TO_FRAMES(SPELL_VAD_MAX_LETTER_MS),
+        .early_commit_frames = MS_TO_FRAMES(SPELL_EARLY_MIN_SILENCE_MS),
         .eow_frames          = MS_TO_FRAMES(SPELL_VAD_END_OF_WORD_MS),
         .preroll             = s_preroll,
         .preroll_samples     = VAD_PREROLL_SAMPLES,

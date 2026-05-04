@@ -28,6 +28,13 @@
  *     silence (no onset) without a new letter generates a SEG_EVT_EOW.
  *     Inter-letter silence (between letters within a word) does NOT
  *     trigger EOW; it just keeps the word_in_flight flag set.
+ *   - Early-commit window: after a letter is emitted, the first time the
+ *     post-letter silence count crosses early_commit_frames (without a new
+ *     onset) generates a SEG_EVT_EARLY_COMMIT_WINDOW. The decoder uses this
+ *     to evaluate its early-commit predicate without polling. Latched
+ *     per-gap: fires exactly once per inter-letter silence cycle, never
+ *     twice without an intervening onset. Ordering with EOW is guaranteed
+ *     by seg_init validating early_commit_frames < eow_frames.
  *
  * Frame size and sample rate are configured at init() and fixed for the
  * lifetime of the state. seg_process_frame() expects exactly cfg.frame_samples
@@ -68,6 +75,7 @@ typedef struct {
     int   off_frames;               ///< sub-off frames to confirm offset (~5 = 80 ms)
     int   min_letter_frames;        ///< reject letters shorter than this (~10 = 160 ms)
     int   max_letter_frames;        ///< force-split letters longer than this (~50 = 800 ms)
+    int   early_commit_frames;      ///< inter-letter silence frames to fire early-commit window (~31 = 500 ms)
     int   eow_frames;               ///< silence frames to declare end-of-word (~75 = 1200 ms)
 
     // --- Buffers (caller-allocated, lifetime ≥ state) ---
@@ -93,8 +101,9 @@ typedef struct {
 
     seg_state_kind_t state;
     bool             word_in_flight;        ///< saw an emitted letter since last EOW
+    bool             early_commit_window_fired; ///< latch: per-gap, reset on next onset
     int              silent_frames_offset;  ///< for offset confirmation
-    int              silent_frames_eow;     ///< for end-of-word countdown
+    int              silent_frames_eow;     ///< for end-of-word countdown (also drives early-commit window)
     int              letter_frames;         ///< frames accumulated in current letter
     float            ema_dbfs;              ///< smoothed RMS
 
@@ -120,6 +129,7 @@ typedef enum {
     SEG_EVT_LETTER_REJECTED_SHORT,  ///< letter completed but below min_letter_frames; not emitted
     SEG_EVT_END_OF_WORD,            ///< sustained silence after at least one emitted letter
     SEG_EVT_FORCE_SPLIT,            ///< max_letter_frames reached; same as LETTER_EMITTED but flagged
+    SEG_EVT_EARLY_COMMIT_WINDOW,    ///< inter-letter silence crossed early_commit_frames (latch: once per gap)
 } seg_event_kind_t;
 
 typedef struct {
