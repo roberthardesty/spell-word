@@ -9,6 +9,7 @@ dependencies.lock
 # core .o files get dropped next to the source by tools/<name>_replay/Makefile.
 components/segmenter/*.o
 components/decoder/*.o
+components/letter_recognizer/*.o
 
 # --- Editor / OS ---
 .cache/
