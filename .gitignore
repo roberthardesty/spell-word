@@ -10,6 +10,7 @@ dependencies.lock
 components/segmenter/*.o
 components/decoder/*.o
 components/letter_recognizer/*.o
+components/spell_ui/*.o
 
 # --- Editor / OS ---
 .cache/

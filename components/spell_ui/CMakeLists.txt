@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "playback_stub.c"
+        "ui_core.c"
     INCLUDE_DIRS
         "include"
     REQUIRES
