@@ -152,7 +152,12 @@
 // =============================================================================
 
 #define SPELL_LETTER_TOP_K            5
-#define SPELL_TENSOR_ARENA_SIZE       (512 * 1024)
+// Arena is allocated from internal SRAM (MALLOC_CAP_INTERNAL) — see the
+// comment block at the head of letter_recognizer.cpp. 256 KB is a
+// pessimistic ceiling for the 51 KB model (expected arena_used ≈ 100-150 KB).
+// Tighten to ≤ 1.2 × measured arena_used_bytes after on-board boot logs
+// confirm the actual figure.
+#define SPELL_TENSOR_ARENA_SIZE       (256 * 1024)
 #define SPELL_MODEL_PARTITION_LABEL   "model"
 #define SPELL_INFERENCE_TASK_STACK    8192       // bytes; heavy buffers in PSRAM heap
 

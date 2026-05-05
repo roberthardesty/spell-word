@@ -26,12 +26,20 @@
  * Operational details that DO carry over verbatim, called out so they
  * survive review:
  *
- *   - Tensor arena lives in PSRAM. The activations of any non-trivial
- *     DS-CNN exceed available contiguous internal SRAM. Size with slack;
- *     log arena_used_bytes() after AllocateTensors.
+ *   - Tensor arena lives in **internal SRAM** (MALLOC_CAP_INTERNAL).
+ *     PSRAM placement is 3-5× slower for TFLM operators on ESP32-S3 and
+ *     blows the ADR-0001 (500 ms early-commit floor) and ADR-0005 (~40 ms
+ *     W-recovery re-inference) latency budgets, so SRAM is the design
+ *     choice — not a tuning knob. The 51 KB DS-CNN's activations fit; size
+ *     SPELL_TENSOR_ARENA_SIZE pessimistically and log arena_used_bytes()
+ *     after AllocateTensors so the ceiling can be tightened to
+ *     ≤ 1.2 × actual.
  *   - WDT for Core 1 IDLE is disabled in sdkconfig.defaults
- *     (CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n). Without it the ~250 ms
- *     Invoke() trips the watchdog.
+ *     (CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n). With the SRAM arena
+ *     Invoke() drops to ~30-40 ms (well under the WDT timeout), but the
+ *     disable is preserved as defense-in-depth — the watchdog tripped
+ *     when the arena lived in PSRAM and Invoke() ran ~250 ms, and this
+ *     guards against regressions if a larger model lands later.
  *   - Both Float32 and Int8 input paths are handled. Useful for bringing
  *     up a float-precision model first, swapping to int8 after accuracy
  *     is validated.
@@ -252,10 +260,13 @@ static bool setup_interpreter()
     const tflite::Model *model = tflite::GetModel(s_model_buf);
 
     if (!s_tensor_arena) {
+        // Internal SRAM — PSRAM placement is 3-5× slower for TFLM ops on
+        // ESP32-S3, blowing the ADR-0001 (early-commit) and ADR-0005
+        // (W-recovery) latency budgets.
         s_tensor_arena = static_cast<uint8_t *>(
-            heap_caps_malloc(SPELL_TENSOR_ARENA_SIZE, MALLOC_CAP_SPIRAM));
+            heap_caps_malloc(SPELL_TENSOR_ARENA_SIZE, MALLOC_CAP_INTERNAL));
         if (!s_tensor_arena) {
-            ESP_LOGE(TAG, "PSRAM alloc for tensor arena failed (%d B)",
+            ESP_LOGE(TAG, "internal SRAM alloc for tensor arena failed (%d B)",
                      SPELL_TENSOR_ARENA_SIZE);
             return false;
         }
