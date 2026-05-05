@@ -119,6 +119,52 @@ static std::atomic<uint32_t>   s_gate_skip_count       {0};
 static std::atomic<uint32_t>   s_drop_count            {0};  // queue-full drops
 static std::atomic<uint32_t>   s_invalid_drop_count    {0};  // bad inputs etc.
 
+// ── PCM ring (internal, for W-recovery in #30) ───────────────────────
+//
+// Retains the last SPELL_W_DETECT_PCM_RING_DEPTH inference-eligible utterance
+// PCM windows. The W-recovery cycle (ADR-0005, integrated in #30) reads the
+// ring directly to concatenate the 3 utterances ending at the current top-1
+// 'U' and re-run inference on the merged window.
+//
+// Storage is one contiguous PSRAM block sized at
+// SPELL_W_DETECT_PCM_RING_DEPTH × SPELL_INFERENCE_WINDOW_BYTES (≈100 KB).
+// Each slot is a fixed-size SPELL_INFERENCE_WINDOW_SAMPLES window. We copy
+// the inbound utterance into the slot rather than swapping pointers because
+// the segmenter retains its allocation pattern and the ring lifetime is
+// independent of any individual inbound buffer.
+//
+// The ring is INTERNAL to the recognizer — no public access function is
+// exposed (per ADR-0005, W-recovery is also internal to the recognizer, so
+// there is no other consumer).
+static int16_t  *s_pcm_ring_storage   = nullptr;
+static size_t    s_pcm_ring_n_samples[SPELL_W_DETECT_PCM_RING_DEPTH] = {0};
+static unsigned  s_pcm_ring_head      = 0;   // next-write index
+static unsigned  s_pcm_ring_count     = 0;   // grows 0 → DEPTH then stays
+
+// Insert a window into the ring at the head, evicting the oldest entry.
+// Called only on the inference-success path so the ring tracks utterances
+// that produced a LETTER_RECOGNIZED event. Buffers shorter than the window
+// are right-padded with zero (the recognizer's input is already zero-padded
+// to SPELL_INFERENCE_WINDOW_SAMPLES by the segmenter, so this is a guard).
+static void pcm_ring_insert(const int16_t *pcm, size_t n_samples)
+{
+    if (!s_pcm_ring_storage) return;
+
+    size_t cap = SPELL_INFERENCE_WINDOW_SAMPLES;
+    size_t n   = (n_samples > cap) ? cap : n_samples;
+
+    int16_t *slot = s_pcm_ring_storage + (size_t)s_pcm_ring_head * cap;
+    memcpy(slot, pcm, n * sizeof(int16_t));
+    if (n < cap) {
+        memset(slot + n, 0, (cap - n) * sizeof(int16_t));
+    }
+    s_pcm_ring_n_samples[s_pcm_ring_head] = n;
+    s_pcm_ring_head = (s_pcm_ring_head + 1u) % SPELL_W_DETECT_PCM_RING_DEPTH;
+    if (s_pcm_ring_count < SPELL_W_DETECT_PCM_RING_DEPTH) {
+        s_pcm_ring_count++;
+    }
+}
+
 // =====================================================================
 // Op resolver
 // =====================================================================
@@ -491,6 +537,10 @@ static void recognizer_task(void *arg)
         esp_event_post(SPELL_RECOGNIZER_EVENT, SPELL_EVENT_LETTER_RECOGNIZED,
                        &evt, sizeof(evt), 0);
 
+        // Retain a copy in the PCM ring for W-recovery (#30). The original
+        // inbound buffer is freed below — the ring owns its own storage.
+        pcm_ring_insert(utt.pcm, utt.n_samples);
+
         heap_caps_free(utt.pcm);
     }
 }
@@ -518,6 +568,26 @@ esp_err_t letter_recognizer_init(void)
     if (!s_features) {
         ESP_LOGE(TAG, "PSRAM alloc failed for feature buffer");
         return ESP_ERR_NO_MEM;
+    }
+
+    // ── PCM ring storage (W-recovery, #30) ───────────────────────────
+    // 4 × 25,600 B = 102,400 B contiguous in PSRAM. Fail loudly here —
+    // ADR-0005's W-recovery is load-bearing for accurate W spelling.
+    {
+        const size_t ring_bytes =
+            (size_t)SPELL_W_DETECT_PCM_RING_DEPTH * SPELL_INFERENCE_WINDOW_BYTES;
+        s_pcm_ring_storage = static_cast<int16_t *>(heap_caps_malloc(
+            ring_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (!s_pcm_ring_storage) {
+            ESP_LOGE(TAG, "PSRAM alloc for PCM ring failed (%u B, depth=%d)",
+                     (unsigned)ring_bytes, SPELL_W_DETECT_PCM_RING_DEPTH);
+            return ESP_ERR_NO_MEM;
+        }
+        memset(s_pcm_ring_storage, 0, ring_bytes);
+        ESP_LOGI(TAG, "PCM ring allocated: %d slots × %d B = %u B PSRAM",
+                 SPELL_W_DETECT_PCM_RING_DEPTH,
+                 SPELL_INFERENCE_WINDOW_BYTES,
+                 (unsigned)ring_bytes);
     }
 
     // ── Load model (non-fatal if empty — awaiting OTA) ───────────────
