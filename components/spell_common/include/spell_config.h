@@ -156,6 +156,11 @@
 #define SPELL_MODEL_PARTITION_LABEL   "model"
 #define SPELL_INFERENCE_TASK_STACK    8192       // bytes; heavy buffers in PSRAM heap
 
+// Decoder partition labels (subtypes 0x81 / 0x82 in partitions.csv). The
+// label strings are descriptive in-CSV; only the subtypes are load-bearing.
+#define SPELL_MATRIX_PARTITION_LABEL  "confusion"
+#define SPELL_DICT_PARTITION_LABEL    "dictionary"
+
 // Inference utterance queue depth. Letters are emitted at human pace
 // (~3-5 per word, with gaps), so 16 is generous. Overflow drops oldest.
 #define SPELL_INFERENCE_QUEUE_DEPTH   16

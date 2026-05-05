@@ -43,6 +43,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "decoder.h"
 #include "letter_recognizer.h"
 #include "nvs_flash.h"
 #include "sdkconfig.h"
@@ -215,6 +216,20 @@ void app_main(void)
     ESP_ERROR_CHECK(letter_recognizer_init()); // MFCC + TFLM + utterance queue
     ESP_ERROR_CHECK(segmenter_init());         // subscribes to audio_capture
     ESP_ERROR_CHECK(audio_dump_init(10));      // 10 s ring for VAD-failure capture
+
+    // Decoder. Fail-loud at the wrapper level (per #22 spec), but the boot
+    // continues even if the partitions are erased — bring-up boards spell
+    // "into the void" with the recognizer logging top-K events; the decoder
+    // is wired up the moment the matrix + dictionary partitions are flashed.
+    {
+        esp_err_t derr = decoder_init();
+        if (derr != ESP_OK) {
+            ESP_LOGW(TAG, "decoder disabled (init returned %s) — flash the "
+                          "matrix + dictionary partitions to enable",
+                     esp_err_to_name(derr));
+        }
+    }
+
     ESP_ERROR_CHECK(audio_capture_start());    // I2S enabled; data flows
 
     // For now, audio_dump_emit_b64() has no firmware-side trigger — call it

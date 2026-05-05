@@ -1,8 +1,12 @@
 idf_component_register(
     SRCS
         "decoder_core.c"
+        "decoder.c"
     INCLUDE_DIRS
         "include"
     REQUIRES
         spell_common
+        esp_event
+        esp_partition
+        esp_common
 )

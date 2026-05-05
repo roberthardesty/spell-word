@@ -8,6 +8,7 @@ idf_component_register(
         audio_capture
         letter_recognizer
         segmenter
+        decoder
         spell_ui
         audio_dump
         nvs_flash
