@@ -1,0 +1,24 @@
+# Sample top-K event sequence for w_detector_replay.
+#
+# Layout:  event_n , top1_letter , top1_prob [ , extra columns ignored ]
+#
+# This sequence exercises:
+#   1-2  warm-up (predicate is HOLD until two priors exist)
+#   3    confident non-W letter — no trigger (current_is_u=0)
+#   4-5  two low-confidence utterances (the W's syllabic halves) — set up
+#   6    confident 'U' on top of two low priors — TRIGGER (W candidate)
+#   7    confident non-W letter — no trigger
+#   8-9  two more low-conf priors
+#   10   another confident 'U' — TRIGGER (consecutive triggers are allowed
+#        without auto-reset)
+event_n , top1_letter , top1_prob
+1       , C           , 0.92
+2       , A           , 0.88
+3       , T           , 0.95
+4       , X           , 0.30
+5       , Y           , 0.25
+6       , U           , 0.65
+7       , T           , 0.85
+8       , X           , 0.32
+9       , Y           , 0.28
+10      , U           , 0.72
