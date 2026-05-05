@@ -1,0 +1,15 @@
+# Sample dictionary for decoder_replay.
+# Format:  <word_id> <LETTERS>
+# Comments and blank lines are skipped. Letters are A..Z (case-insensitive),
+# length capped at SPELL_MAX_LETTERS_PER_WORD (16).
+
+1 CAT
+2 BAT
+3 BAD
+4 DOG
+5 BANK
+6 BARK
+7 BENT
+8 BAN
+9 WAT
+10 SAT

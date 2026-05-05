@@ -1,0 +1,36 @@
+# Sample event sequence for decoder_replay.
+#
+# Layout (per row, comma-separated, whitespace tolerated):
+#
+#   L , top1L , top1P , top2L , top2P , top3L , top3P , top4L , top4P , top5L , top5P , retract
+#   W
+#   E
+#   R
+#
+# This sample exercises:
+#
+#   - clean spelling of CAT, with an EARLY_COMMIT_WINDOW after T that should
+#     resolve early under default tunables (margin over BAT, BAD vacuous-OK
+#     since the runner-up is far below the threshold)
+#   - explicit EOW after the early commit (no positions remain → no-op)
+#   - W-recovery cycle: two low-confidence utterances followed by a
+#     LETTER_RECOGNIZED with retract=2 (the merged-rerun result), then A T,
+#     then end-of-fixture implicit EOW resolving to WAT
+#
+# Letters use single-letter form (A..Z) for readability; numeric 0..25 also OK.
+
+# === Word 1: CAT, early-commit on inter-letter silence ===
+# The W (EARLY_COMMIT_WINDOW) after T fires the predicate with silence_floor
+# satisfied; all three clauses pass, the decoder commits, and state resets.
+L , C , 0.85 , J , 0.05 , K , 0.04 , M , 0.03 , P , 0.02 , 0
+L , A , 0.85 , J , 0.05 , K , 0.04 , M , 0.03 , P , 0.02 , 0
+L , T , 0.85 , J , 0.05 , K , 0.04 , M , 0.03 , P , 0.02 , 0
+W
+
+# === Word 2: WAT via W-recovery (retract=2 on the third LETTER row) ===
+L , D , 0.30 , U , 0.25 , B , 0.20 , O , 0.15 , Y , 0.10 , 0
+L , Y , 0.30 , U , 0.25 , O , 0.20 , E , 0.15 , I , 0.10 , 0
+L , W , 0.85 , J , 0.05 , K , 0.04 , M , 0.03 , P , 0.02 , 2
+L , A , 0.85 , J , 0.05 , K , 0.04 , M , 0.03 , P , 0.02 , 0
+L , T , 0.85 , J , 0.05 , K , 0.04 , M , 0.03 , P , 0.02 , 0
+# implicit EOW at end-of-file → resolves to WAT
