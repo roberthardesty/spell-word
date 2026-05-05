@@ -446,6 +446,231 @@ static void test_retract_two_replaces(void)
     printf("PASS: %s\n", __func__);
 }
 
+// ===========================================================================
+// Early-commit predicate tests (Vikunja #21)
+//
+// dec_try_early_commit() takes the in-flight state plus a boolean indicating
+// whether the segmenter's post-letter silence floor has been crossed (i.e.
+// SPELL_EVENT_EARLY_COMMIT_WINDOW just arrived). It returns a per-clause
+// diagnostic struct so the IDF wrapper can log "which clause prevented or
+// caused commit" (US-13). The acceptance set:
+//
+//   - clean pass: all three clauses pass → kind = RESOLVED
+//   - silence floor failing in isolation (LETTER_RECOGNIZED path)
+//   - margin-over-runner-up failing in isolation
+//   - margin-over-longer failing in isolation
+//   - prefix-truncation safeguard: BAN inside BANK does NOT commit on a
+//     letter event (silence floor false) even though margin_longer passes
+// ===========================================================================
+
+// Helper: high-confidence top-K for a single dominant letter.
+static dec_top_k_t mk_high(char c)
+{
+    char buf[6] = { c, 'J', 'K', 'M', 'P', 0 };
+    // Ensure no collision with the dominant letter in the distractor slots.
+    for (int k = 1; k < 5; k++) if (buf[k] == c) buf[k] = 'Q';
+    return mk_top_k(buf, P_HIGH);
+}
+
+// ---------------------------------------------------------------------------
+// Test #8 — All three clauses pass on an EARLY_COMMIT_WINDOW event → RESOLVED.
+// Acceptance: "clean commit when all three clauses pass"; "commit triggered
+// by EARLY_COMMIT_WINDOW event with predicate met"
+// ---------------------------------------------------------------------------
+static void test_early_commit_clean_pass(void)
+{
+    dec_word_t words[] = {
+        mk_word(1, "CAT"),
+        mk_word(2, "DOG"),  // disjoint letter set — runner-up trivially loses
+    };
+    dec_dict_t dict = { .words = words, .n_words = 2 };
+    dec_confusion_t conf = conf_neutral();
+    dec_config_t cfg; dec_config_default(&cfg);
+    dec_state_t st;
+    if (dec_init(&st, &dict, &conf, &cfg) != 0) {
+        fprintf(stderr, "FAIL [%s]: dec_init rejected config\n", __func__);
+        exit(1);
+    }
+
+    dec_top_k_t tk_c = mk_high('C');
+    dec_top_k_t tk_a = mk_high('A');
+    dec_top_k_t tk_t = mk_high('T');
+    dec_on_letter(&st, &tk_c, 0);
+    dec_on_letter(&st, &tk_a, 0);
+    dec_on_letter(&st, &tk_t, 0);
+
+    // EARLY_COMMIT_WINDOW just fired → silence floor satisfied.
+    dec_early_commit_eval_t e = dec_try_early_commit(&st, true);
+
+    ASSERT_EQ_INT(e.margin_runnerup_ok, 1, "runnerup margin clause must pass");
+    ASSERT_EQ_INT(e.margin_longer_ok,   1, "longer-competitor clause must pass");
+    ASSERT_EQ_INT(e.silence_floor_ok,   1, "silence-floor clause must pass on window event");
+    ASSERT_EQ_INT(e.kind, DEC_EARLY_COMMIT_RESOLVED, "all clauses pass → commit");
+    ASSERT_EQ_INT(e.word_id, 1, "should resolve to CAT");
+
+    printf("PASS: %s\n", __func__);
+}
+
+// ---------------------------------------------------------------------------
+// Test #9 — Silence-floor clause fails in isolation (LETTER_RECOGNIZED path).
+// Acceptance: "each predicate clause failing in isolation" — silence-floor case
+// ---------------------------------------------------------------------------
+static void test_early_commit_silence_floor_fails(void)
+{
+    dec_word_t words[] = {
+        mk_word(1, "CAT"),
+        mk_word(2, "DOG"),
+    };
+    dec_dict_t dict = { .words = words, .n_words = 2 };
+    dec_confusion_t conf = conf_neutral();
+    dec_config_t cfg; dec_config_default(&cfg);
+    dec_state_t st;
+    if (dec_init(&st, &dict, &conf, &cfg) != 0) exit(1);
+
+    dec_top_k_t tk_c = mk_high('C');
+    dec_top_k_t tk_a = mk_high('A');
+    dec_top_k_t tk_t = mk_high('T');
+    dec_on_letter(&st, &tk_c, 0);
+    dec_on_letter(&st, &tk_a, 0);
+    dec_on_letter(&st, &tk_t, 0);
+
+    // LETTER_RECOGNIZED path: predicate runs but silence floor not yet crossed.
+    dec_early_commit_eval_t e = dec_try_early_commit(&st, false);
+
+    ASSERT_EQ_INT(e.margin_runnerup_ok, 1, "runnerup clause should pass on clean spelling");
+    ASSERT_EQ_INT(e.margin_longer_ok,   1, "longer clause should pass — no longer competitors");
+    ASSERT_EQ_INT(e.silence_floor_ok,   0, "silence-floor clause must fail on letter event");
+    ASSERT_EQ_INT(e.kind, DEC_EARLY_COMMIT_HOLD, "any clause failing → HOLD");
+
+    printf("PASS: %s\n", __func__);
+}
+
+// ---------------------------------------------------------------------------
+// Test #10 — Margin-over-runner-up fails in isolation.
+// Acceptance: "each predicate clause failing in isolation" — runnerup case
+// ---------------------------------------------------------------------------
+static void test_early_commit_runnerup_margin_fails(void)
+{
+    dec_word_t words[] = {
+        mk_word(1, "CAT"),
+        mk_word(2, "BAT"),  // identical except position 0 — close runner-up
+    };
+    dec_dict_t dict = { .words = words, .n_words = 2 };
+    dec_confusion_t conf = conf_neutral();
+    dec_config_t cfg; dec_config_default(&cfg);
+    dec_state_t st;
+    if (dec_init(&st, &dict, &conf, &cfg) != 0) exit(1);
+
+    // Position 0: ambiguous between C (top-1) and B (top-2) — both ~0.45.
+    static const float P_AMBIG_TOP12[5] = { 0.45f, 0.45f, 0.04f, 0.03f, 0.03f };
+    dec_top_k_t tk_cb = mk_top_k("CBJKM", P_AMBIG_TOP12);
+    dec_top_k_t tk_a  = mk_high('A');
+    dec_top_k_t tk_t  = mk_high('T');
+    dec_on_letter(&st, &tk_cb, 0);
+    dec_on_letter(&st, &tk_a,  0);
+    dec_on_letter(&st, &tk_t,  0);
+
+    dec_early_commit_eval_t e = dec_try_early_commit(&st, true);
+
+    ASSERT_EQ_INT(e.margin_runnerup_ok, 0, "ambiguous top-1/top-2 must fail runnerup clause");
+    ASSERT_EQ_INT(e.margin_longer_ok,   1, "no length-4 candidates → longer clause vacuous-pass");
+    ASSERT_EQ_INT(e.silence_floor_ok,   1, "silence floor true on window event");
+    ASSERT_EQ_INT(e.kind, DEC_EARLY_COMMIT_HOLD, "tight runnerup → HOLD");
+    ASSERT_LT_FLT(e.margin_runnerup, cfg.early_margin_runnerup,
+                  "computed margin must be below threshold");
+
+    printf("PASS: %s\n", __func__);
+}
+
+// ---------------------------------------------------------------------------
+// Test #11 — Margin-over-longer-by-1-or-2 fails in isolation.
+// We sweep the threshold up so a normally-acceptable margin fails — keeps the
+// score-machinery defaults intact while exercising the longer-competitor path.
+// Acceptance: "each predicate clause failing in isolation" — longer case
+// ---------------------------------------------------------------------------
+static void test_early_commit_longer_margin_fails(void)
+{
+    dec_word_t words[] = {
+        mk_word(1, "BAN"),
+        mk_word(2, "BANK"),  // length-(N+1); aligns with one deletion
+    };
+    dec_dict_t dict = { .words = words, .n_words = 2 };
+    dec_confusion_t conf = conf_neutral();
+    dec_config_t cfg; dec_config_default(&cfg);
+    // Force the longer clause to fail by raising its threshold above the
+    // natural margin (~|del_penalty| = 2.5).
+    cfg.early_margin_longer = 5.0f;
+    dec_state_t st;
+    if (dec_init(&st, &dict, &conf, &cfg) != 0) exit(1);
+
+    dec_top_k_t tk_b = mk_high('B');
+    dec_top_k_t tk_a = mk_high('A');
+    dec_top_k_t tk_n = mk_high('N');
+    dec_on_letter(&st, &tk_b, 0);
+    dec_on_letter(&st, &tk_a, 0);
+    dec_on_letter(&st, &tk_n, 0);
+
+    dec_early_commit_eval_t e = dec_try_early_commit(&st, true);
+
+    ASSERT_EQ_INT(e.margin_runnerup_ok, 1, "BAN is the only length-3 word → runnerup vacuous-pass");
+    ASSERT_EQ_INT(e.margin_longer_ok,   0, "BANK is close enough to BAN to fail raised threshold");
+    ASSERT_EQ_INT(e.silence_floor_ok,   1, "silence floor true on window event");
+    ASSERT_EQ_INT(e.kind, DEC_EARLY_COMMIT_HOLD, "close longer → HOLD");
+    ASSERT_LT_FLT(e.margin_longer, cfg.early_margin_longer,
+                  "computed longer-margin must be below the raised threshold");
+
+    printf("PASS: %s\n", __func__);
+}
+
+// ---------------------------------------------------------------------------
+// Test #12 — Prefix-truncation safeguard (BAN inside BANK).
+// With default thresholds, the *silence floor* is the load-bearing clause:
+// BAN beats BANK by ~|del_penalty| = 2.5 which exceeds the 2.0 longer-margin
+// default. So on a LETTER_RECOGNIZED event (silence_floor=false) the predicate
+// must HOLD purely on the silence-floor clause. On the EARLY_COMMIT_WINDOW
+// event (silence_floor=true), if the user truly paused at BAN it does commit —
+// that is the contract; the user has 500 ms to say K before the window fires.
+// Acceptance: "Prefix-truncation (BAN inside BANK) does not commit early
+// until the silence floor passes — verified by per-clause failure tests"
+// ---------------------------------------------------------------------------
+static void test_early_commit_prefix_truncation_safeguard(void)
+{
+    dec_word_t words[] = {
+        mk_word(1, "BAN"),
+        mk_word(2, "BANK"),
+    };
+    dec_dict_t dict = { .words = words, .n_words = 2 };
+    dec_confusion_t conf = conf_neutral();
+    dec_config_t cfg; dec_config_default(&cfg);  // defaults — threshold not swept
+    dec_state_t st;
+    if (dec_init(&st, &dict, &conf, &cfg) != 0) exit(1);
+
+    dec_top_k_t tk_b = mk_high('B');
+    dec_top_k_t tk_a = mk_high('A');
+    dec_top_k_t tk_n = mk_high('N');
+    dec_on_letter(&st, &tk_b, 0);
+    dec_on_letter(&st, &tk_a, 0);
+    dec_on_letter(&st, &tk_n, 0);
+
+    // On letter event: silence floor is the only failing clause.
+    dec_early_commit_eval_t e_letter = dec_try_early_commit(&st, false);
+    ASSERT_EQ_INT(e_letter.margin_runnerup_ok, 1, "BAN unique length-3 → runnerup vacuous-pass");
+    ASSERT_EQ_INT(e_letter.margin_longer_ok,   1,
+                  "with default longer-margin 2.0, BAN-vs-BANK margin (~2.5) clears the bar");
+    ASSERT_EQ_INT(e_letter.silence_floor_ok, 0, "silence-floor clause is the safeguard");
+    ASSERT_EQ_INT(e_letter.kind, DEC_EARLY_COMMIT_HOLD,
+                  "prefix-truncation must not commit on letter events");
+
+    // On window event with the same in-flight state: if the user genuinely
+    // paused 500 ms after BAN, the commit IS correct — that is the contract.
+    dec_early_commit_eval_t e_window = dec_try_early_commit(&st, true);
+    ASSERT_EQ_INT(e_window.kind, DEC_EARLY_COMMIT_RESOLVED,
+                  "after silence floor crosses, BAN commits — user paused, that means BAN");
+    ASSERT_EQ_INT(e_window.word_id, 1, "should resolve to BAN");
+
+    printf("PASS: %s\n", __func__);
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -458,6 +683,12 @@ int main(void)
     test_flat_distribution_abstains();
     test_overflow_abstains();
     test_retract_two_replaces();
+
+    test_early_commit_clean_pass();
+    test_early_commit_silence_floor_fails();
+    test_early_commit_runnerup_margin_fails();
+    test_early_commit_longer_margin_fails();
+    test_early_commit_prefix_truncation_safeguard();
 
     printf("\nAll tests passed.\n");
     return 0;

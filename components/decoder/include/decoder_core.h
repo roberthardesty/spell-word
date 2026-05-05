@@ -25,9 +25,13 @@
  *     returns the best word or abstains when the score margin is below
  *     SPELL_DECISION_MARGIN.
  *
- *   - The early-commit predicate (margin-over-runner-up, margin-over-longer,
- *     silence floor) is intentionally NOT implemented in this slice; it
- *     lands in Vikunja #21 against the same in-flight state.
+ *   - The aggressive early-commit predicate (PRD §"Aggressive early-commit
+ *     predicate", ADR-0001) is dec_try_early_commit(). It is a pure read-only
+ *     function over the same in-flight state, so the caller can run it on
+ *     every LETTER_RECOGNIZED event and every EARLY_COMMIT_WINDOW event and
+ *     decide whether to publish WORD_RESOLVED. The post-letter silence floor
+ *     (third clause) is supplied by the caller as a boolean: false on letter
+ *     events, true on window events. decoder_core stays time-agnostic.
  *
  * The state struct holds no dynamic allocation — the in-flight buffer is a
  * fixed array sized to SPELL_MAX_LETTERS_PER_WORD. Dictionary and confusion
@@ -92,10 +96,12 @@ typedef struct {
 // =============================================================================
 
 typedef struct {
-    float alpha;             ///< SPELL_DECODER_ALPHA — confusion-matrix mix weight
-    float decision_margin;   ///< SPELL_DECISION_MARGIN — abstain when below
-    float ins_penalty;       ///< SPELL_EDIT_INS_PENALTY — utterance was spurious (cough)
-    float del_penalty;       ///< SPELL_EDIT_DEL_PENALTY — letter was missed (swallowed pause)
+    float alpha;                 ///< SPELL_DECODER_ALPHA — confusion-matrix mix weight
+    float decision_margin;       ///< SPELL_DECISION_MARGIN — abstain when below (full EOW)
+    float ins_penalty;           ///< SPELL_EDIT_INS_PENALTY — utterance was spurious (cough)
+    float del_penalty;           ///< SPELL_EDIT_DEL_PENALTY — letter was missed (swallowed pause)
+    float early_margin_runnerup; ///< SPELL_EARLY_MARGIN_RUNNERUP — clause 1 threshold
+    float early_margin_longer;   ///< SPELL_EARLY_MARGIN_LONGER  — clause 2 threshold
 } dec_config_t;
 
 /// Fill @p cfg with the spell_config.h defaults.
@@ -173,6 +179,62 @@ void dec_on_letter(dec_state_t *st,
  * exists. Pure function over @p st.
  */
 dec_resolution_t dec_resolve_full_eow(const dec_state_t *st);
+
+// =============================================================================
+// Aggressive early-commit predicate (PRD §"Aggressive early-commit predicate",
+// ADR-0001). Caller (IDF wrapper) evaluates on every LETTER_RECOGNIZED event
+// (silence_floor_satisfied = false) and every EARLY_COMMIT_WINDOW event
+// (silence_floor_satisfied = true) and publishes WORD_RESOLVED on
+// DEC_EARLY_COMMIT_RESOLVED. Per-clause flags drive US-13 diagnostic logging.
+// =============================================================================
+
+typedef enum {
+    DEC_EARLY_COMMIT_HOLD     = 0,   ///< at least one clause failed; do not commit
+    DEC_EARLY_COMMIT_RESOLVED = 1,   ///< all three clauses passed; commit now
+} dec_early_commit_kind_t;
+
+typedef struct {
+    dec_early_commit_kind_t kind;
+
+    /// Clause 1: margin over same-length runner-up
+    bool  margin_runnerup_ok;
+    float margin_runnerup;     ///< score(best) - score(runner_up_same_length); +INF if no runner-up
+    /// Clause 2: margin over best length-(N+1) or length-(N+2) candidate
+    bool  margin_longer_ok;
+    float margin_longer;       ///< score(best) - score(best_longer); +INF if no longer competitor
+    /// Clause 3: post-letter silence floor (caller-supplied)
+    bool  silence_floor_ok;
+
+    /// Best same-length candidate. word_id valid iff kind == RESOLVED.
+    uint32_t word_id;
+    float    score;            ///< best same-length score
+    int      n_positions;      ///< utterance count at evaluation time (informational)
+} dec_early_commit_eval_t;
+
+/**
+ * Evaluate the three-clause early-commit predicate. Pure function over
+ * @p st; never mutates state. The caller decides what to do with the result
+ * (publish WORD_RESOLVED and dec_reset() on RESOLVED; log per-clause flags
+ * on HOLD).
+ *
+ * The predicate considers same-length dictionary words (no edits) for the
+ * "best" and "runner-up" pool, and length-(N+1) / length-(N+2) words via
+ * the deletion-penalty path for the "longer competitor" pool. Insertion
+ * alignments (shorter-than-N) are intentionally not considered at early
+ * commit — the full-EOW resolver picks those up on dec_resolve_full_eow().
+ *
+ * On overflow, n_positions == 0, or empty dictionary, returns kind = HOLD
+ * with all clause flags false (no commit). Computed margins use +INF when
+ * the relevant competitor pool is empty (vacuously satisfies the clause).
+ *
+ * @param silence_floor_satisfied  true on EARLY_COMMIT_WINDOW events; false
+ *                                 on LETTER_RECOGNIZED events. The third
+ *                                 clause is load-bearing (ADR-0001) — it
+ *                                 prevents prefix-truncation (BAN inside
+ *                                 BANK) from committing mid-word.
+ */
+dec_early_commit_eval_t dec_try_early_commit(const dec_state_t *st,
+                                             bool silence_floor_satisfied);
 
 #ifdef __cplusplus
 }  // extern "C"

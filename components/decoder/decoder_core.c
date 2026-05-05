@@ -26,10 +26,12 @@
 
 void dec_config_default(dec_config_t *cfg)
 {
-    cfg->alpha           = SPELL_DECODER_ALPHA;
-    cfg->decision_margin = SPELL_DECISION_MARGIN;
-    cfg->ins_penalty     = SPELL_EDIT_INS_PENALTY;
-    cfg->del_penalty     = SPELL_EDIT_DEL_PENALTY;
+    cfg->alpha                  = SPELL_DECODER_ALPHA;
+    cfg->decision_margin        = SPELL_DECISION_MARGIN;
+    cfg->ins_penalty            = SPELL_EDIT_INS_PENALTY;
+    cfg->del_penalty            = SPELL_EDIT_DEL_PENALTY;
+    cfg->early_margin_runnerup  = SPELL_EARLY_MARGIN_RUNNERUP;
+    cfg->early_margin_longer    = SPELL_EARLY_MARGIN_LONGER;
 }
 
 int dec_init(dec_state_t *st,
@@ -156,6 +158,64 @@ static inline float safe_log(float p)
     return logf(p > DEC_LOG_FLOOR ? p : DEC_LOG_FLOOR);
 }
 
+// Score @p word against the @p n_positions utterance posteriors when the
+// word has exactly (n_positions + dels) letters — i.e. the alignment skips
+// `dels` word positions, charging del_penalty per skip. Supports dels=0..2.
+// Returns -INFINITY if the word's length doesn't match the requested skip
+// count or the word is malformed.
+static float score_with_deletions(const float posteriors[][DEC_ALPHABET_SIZE],
+                                  int n_positions,
+                                  const dec_word_t *word,
+                                  int dels,
+                                  float del_penalty)
+{
+    int n = n_positions;
+    int m = (int)word->length;
+
+    if (m <= 0 || m > SPELL_MAX_LETTERS_PER_WORD) return -INFINITY;
+    if (dels < 0 || dels > 2)                     return -INFINITY;
+    if (m != n + dels)                            return -INFINITY;
+
+    if (dels == 0) {
+        float s = 0.0f;
+        for (int i = 0; i < n; i++) {
+            s += safe_log(posteriors[i][word->letters[i]]);
+        }
+        return s;
+    }
+
+    if (dels == 1) {
+        float best = -INFINITY;
+        for (int skip = 0; skip < m; skip++) {
+            float s = del_penalty;
+            int ui = 0;
+            for (int j = 0; j < m; j++) {
+                if (j == skip) continue;
+                s += safe_log(posteriors[ui][word->letters[j]]);
+                ui++;
+            }
+            if (s > best) best = s;
+        }
+        return best;
+    }
+
+    // dels == 2: pick the best pair of word positions to skip.
+    float best = -INFINITY;
+    for (int skip_a = 0; skip_a < m; skip_a++) {
+        for (int skip_b = skip_a + 1; skip_b < m; skip_b++) {
+            float s = 2.0f * del_penalty;
+            int ui = 0;
+            for (int j = 0; j < m; j++) {
+                if (j == skip_a || j == skip_b) continue;
+                s += safe_log(posteriors[ui][word->letters[j]]);
+                ui++;
+            }
+            if (s > best) best = s;
+        }
+    }
+    return best;
+}
+
 static float score_word(const float posteriors[][DEC_ALPHABET_SIZE],
                         int n_positions,
                         const dec_word_t *word,
@@ -170,39 +230,18 @@ static float score_word(const float posteriors[][DEC_ALPHABET_SIZE],
     int diff = m - n;
     if (diff < -1 || diff > 1) return -INFINITY;
 
-    if (diff == 0) {
-        float s = 0.0f;
-        for (int i = 0; i < n; i++) {
-            s += safe_log(posteriors[i][word->letters[i]]);
-        }
-        return s;
-    }
+    if (diff == 0) return score_with_deletions(posteriors, n, word, 0, del_penalty);
+    if (diff == 1) return score_with_deletions(posteriors, n, word, 1, del_penalty);
 
-    if (diff == -1) {
-        // n = m + 1: skip one utterance.
-        float best = -INFINITY;
-        for (int skip = 0; skip < n; skip++) {
-            float s = ins_penalty;
-            int wj = 0;
-            for (int i = 0; i < n; i++) {
-                if (i == skip) continue;
-                s += safe_log(posteriors[i][word->letters[wj]]);
-                wj++;
-            }
-            if (s > best) best = s;
-        }
-        return best;
-    }
-
-    // diff == +1, m = n + 1: skip one word position.
+    // diff == -1, n = m + 1: skip one utterance, charge ins_penalty.
     float best = -INFINITY;
-    for (int skip = 0; skip < m; skip++) {
-        float s = del_penalty;
-        int ui = 0;
-        for (int j = 0; j < m; j++) {
-            if (j == skip) continue;
-            s += safe_log(posteriors[ui][word->letters[j]]);
-            ui++;
+    for (int skip = 0; skip < n; skip++) {
+        float s = ins_penalty;
+        int wj = 0;
+        for (int i = 0; i < n; i++) {
+            if (i == skip) continue;
+            s += safe_log(posteriors[i][word->letters[wj]]);
+            wj++;
         }
         if (s > best) best = s;
     }
@@ -270,4 +309,86 @@ dec_resolution_t dec_resolve_full_eow(const dec_state_t *st)
     r.kind    = DEC_OUTCOME_RESOLVED;
     r.word_id = st->dict->words[best_idx].word_id;
     return r;
+}
+
+// =============================================================================
+// Aggressive early-commit predicate (PRD §"Aggressive early-commit predicate",
+// ADR-0001). Three clauses: margin over same-length runner-up, margin over
+// best length-(N+1)/(N+2) competitor, post-letter silence floor (caller-
+// supplied). Pure read-only over @p st.
+// =============================================================================
+
+dec_early_commit_eval_t dec_try_early_commit(const dec_state_t *st,
+                                             bool silence_floor_satisfied)
+{
+    dec_early_commit_eval_t e;
+    memset(&e, 0, sizeof(e));
+    e.kind             = DEC_EARLY_COMMIT_HOLD;
+    e.n_positions      = st ? st->n_positions : 0;
+    e.silence_floor_ok = silence_floor_satisfied;
+
+    if (!st || st->overflowed || st->n_positions == 0 || st->dict->n_words == 0) {
+        return e;
+    }
+
+    float posteriors[SPELL_MAX_LETTERS_PER_WORD][DEC_ALPHABET_SIZE];
+    for (int i = 0; i < st->n_positions; i++) {
+        assemble_posterior(&st->positions[i], st->confusion,
+                           st->cfg.alpha, posteriors[i]);
+    }
+
+    // Same-length pool: best + runner-up.
+    float best_same   = -INFINITY;
+    float runner_same = -INFINITY;
+    int   best_idx    = -1;
+
+    // Longer-by-1-or-2 pool: just the best.
+    float best_longer = -INFINITY;
+
+    for (int w = 0; w < st->dict->n_words; w++) {
+        const dec_word_t *word = &st->dict->words[w];
+        int diff = (int)word->length - st->n_positions;
+
+        if (diff == 0) {
+            float s = score_with_deletions(posteriors, st->n_positions, word,
+                                           0, st->cfg.del_penalty);
+            if (s > best_same) {
+                runner_same = best_same;
+                best_same   = s;
+                best_idx    = w;
+            } else if (s > runner_same) {
+                runner_same = s;
+            }
+        } else if (diff == 1 || diff == 2) {
+            float s = score_with_deletions(posteriors, st->n_positions, word,
+                                           diff, st->cfg.del_penalty);
+            if (s > best_longer) best_longer = s;
+        }
+        // Other lengths (shorter than N, or longer by 3+) are not part of
+        // the early-commit candidate pool.
+    }
+
+    if (best_idx < 0 || best_same == -INFINITY) {
+        // No valid same-length candidate to commit to.
+        e.margin_runnerup = 0.0f;
+        e.margin_longer   = 0.0f;
+        return e;
+    }
+
+    e.score        = best_same;
+    e.word_id      = st->dict->words[best_idx].word_id;
+    e.margin_runnerup = (runner_same == -INFINITY)
+                      ? INFINITY
+                      : (best_same - runner_same);
+    e.margin_longer   = (best_longer == -INFINITY)
+                      ? INFINITY
+                      : (best_same - best_longer);
+
+    e.margin_runnerup_ok = (e.margin_runnerup > st->cfg.early_margin_runnerup);
+    e.margin_longer_ok   = (e.margin_longer   > st->cfg.early_margin_longer);
+
+    if (e.margin_runnerup_ok && e.margin_longer_ok && e.silence_floor_ok) {
+        e.kind = DEC_EARLY_COMMIT_RESOLVED;
+    }
+    return e;
 }
