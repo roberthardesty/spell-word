@@ -75,6 +75,7 @@
 // TFLite Micro headers
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
 #include "tensorflow/lite/micro/micro_interpreter.h"
+#include "tensorflow/lite/micro/micro_profiler_interface.h"
 #include "tensorflow/lite/schema/schema_generated.h"
 
 // NOTE: esp-nn SIMD kernels (Conv2D, DepthwiseConv2D, etc.) are linked
@@ -114,6 +115,43 @@ static std::atomic<bool> s_reload_requested{false};
 // from EARS) is dropped; AddSoftmax stays.
 static tflite::MicroMutableOpResolver<9> s_resolver;
 static bool s_resolver_initialized = false;
+
+// ── Per-op-instance profiler (Vikunja #53) ───────────────────────────
+// Splits the existing per-kernel aggregates (`conv_total_time` etc.) into
+// per-graph-position timings so the Conv2D bottleneck can be attributed
+// to a specific op — the four 1×1 PW convs (ops 2/4/6/8) versus the wide
+// first 4×10 conv (op 0). The TFLM canonical MicroProfiler is ~128 KiB
+// BSS (4096 events × 32 B), which won't fit alongside the 118 KiB arena
+// in internal SRAM; this version stores 64 events × 16 B = 1 KiB. Tags
+// are stable string literals from EnumNameBuiltinOperator (see
+// micro_interpreter_graph.cc), so storing the pointer is safe.
+class LetterProfiler : public tflite::MicroProfilerInterface {
+public:
+    static constexpr int kMaxEvents = 64;
+    uint32_t BeginEvent(const char *tag) override {
+        if (n_ >= kMaxEvents) return (uint32_t)(kMaxEvents - 1);
+        tags_[n_]   = tag;
+        starts_[n_] = (uint32_t)esp_timer_get_time();
+        ends_[n_]   = starts_[n_];
+        return (uint32_t)n_++;
+    }
+    void EndEvent(uint32_t handle) override {
+        if (handle < (uint32_t)kMaxEvents) {
+            ends_[handle] = (uint32_t)esp_timer_get_time();
+        }
+    }
+    void     Reset()           { n_ = 0; }
+    int      Count()     const { return n_; }
+    const char *Tag(int i) const { return tags_[i]; }
+    uint32_t Us(int i)   const { return ends_[i] - starts_[i]; }
+private:
+    const char *tags_  [kMaxEvents] = {nullptr};
+    uint32_t    starts_[kMaxEvents] = {0};
+    uint32_t    ends_  [kMaxEvents] = {0};
+    int         n_ = 0;
+};
+
+static LetterProfiler s_profiler;
 
 // ── Feature workspace (MFCC + Δ + ΔΔ, NHWC) ──────────────────────────
 // Shape [SPELL_FEAT_N_FRAMES][SPELL_MFCC_N_COEFFS][SPELL_FEAT_N_CHANNELS],
@@ -326,7 +364,9 @@ static bool setup_interpreter()
     }
 
     s_interpreter = new tflite::MicroInterpreter(
-        model, s_resolver, s_tensor_arena, SPELL_TENSOR_ARENA_SIZE);
+        model, s_resolver, s_tensor_arena, SPELL_TENSOR_ARENA_SIZE,
+        /*resource_variables=*/nullptr,
+        &s_profiler);
 
     if (s_interpreter->AllocateTensors() != kTfLiteOk) {
         ESP_LOGE(TAG, "AllocateTensors failed — arena too small?");
@@ -512,6 +552,7 @@ static void recognizer_task(void *arg)
                   s0  = softmax_total_time, a0  = add_total_time,
                   m0  = mul_total_time;
 
+        s_profiler.Reset();
         int64_t t2 = esp_timer_get_time();
         TfLiteStatus status = s_interpreter->Invoke();
         int64_t dt_invoke_us = esp_timer_get_time() - t2;
@@ -538,6 +579,19 @@ static void recognizer_task(void *arg)
             ESP_LOGI(TAG, "  per-op us: conv=%lld dwconv=%lld fc=%lld "
                           "pool=%lld smax=%lld add=%lld mul=%lld",
                      dc_conv, dc_dc, dc_fc, dc_pool, dc_smax, dc_add, dc_mul);
+
+            // Per-op-instance breakdown (Vikunja #53). Splits the conv=
+            // aggregate by graph position so each Conv2D / DepthwiseConv2D
+            // op can be attributed individually.
+            char obuf[512];
+            int  oi = 0;
+            int  n_evt = s_profiler.Count();
+            for (int e = 0; e < n_evt && oi < (int)sizeof(obuf) - 40; e++) {
+                oi += snprintf(obuf + oi, sizeof(obuf) - oi,
+                               " [%d]%s=%u", e, s_profiler.Tag(e),
+                               (unsigned)s_profiler.Us(e));
+            }
+            ESP_LOGI(TAG, "  per-instance us:%s", obuf);
         }
 
         if (status != kTfLiteOk) {
