@@ -1,0 +1,60 @@
+# Vikunja #53 — esp-nn dispatcher guard fix (load-bearing)
+#
+# Target: managed_components/espressif__esp-nn/src/convolution/esp_nn_conv_esp32s3.c
+# Tested against: esp-nn 1.2.3 (per dependencies.lock at time of fix, 2026-05-07)
+#
+# WHY THIS PATCH EXISTS
+# ---------------------
+# `managed_components/` is gitignored. Any `idf.py reconfigure` that triggers
+# the IDF Component Manager to re-fetch dependencies will silently overwrite
+# this fix and the build will regress to the broken-baseline 532 ms invoke.
+# After any dependency refresh, re-apply this patch before re-benching.
+#
+# WHAT IT DOES
+# ------------
+# The TFLM glue at managed_components/espressif__esp-tflite-micro/.../conv.cc
+# sets filter_dims.channels = 0 by convention (filter channels are derived
+# from input). The esp-nn S3 dispatcher had a grouped-conv guard
+#     if (channels != filter_dims->channels) { ... fall back to ansi ... }
+# that misinterpreted that 0 as "different from input channels", so EVERY
+# Conv2D from TFLM mis-routed to esp_nn_conv_s8_ansi (the pure-C reference
+# kernel) and the SIMD paths were unreachable. Probe-2 cyc/MAC dropped from
+# unmeasurable (probe never fired — call site unreachable) to 0.71 cyc/MAC
+# after this fix. Conv2D total dropped from 495 ms to 47 ms (10.5×). Total
+# invoke dropped from 532 ms to 84 ms cold / 76 ms warm (6.3×).
+#
+# Also note: the grouped-conv guard was almost certainly added by an earlier
+# session that also left the dead 3×3-opt code in this file. Both fixes/edits
+# share the same comment style ("Grouped conv (filter_ch < input_ch): ...").
+# Upstream esp-nn 1.2.3 may not have had this guard at all.
+#
+# HOW TO APPLY
+# ------------
+# From repo root:
+#   patch -p1 < docs/patches/53-esp-nn-conv-dispatcher-guard.patch
+# Or apply by hand: change the `if (channels != filter_dims->channels)` line
+# in esp_nn_conv_s8_esp32s3() to also check filter_dims->channels != 0.
+#
+# LONG-TERM
+# ---------
+# The right fix is upstream — either esp-nn treats 0 as unspecified, or
+# the TFLM glue passes the actual filter channels. Until then this patch
+# must be re-applied after any managed_components refresh. Consider pinning
+# a forked esp-nn ref in main/idf_component.yml if this becomes painful.
+
+--- a/managed_components/espressif__esp-nn/src/convolution/esp_nn_conv_esp32s3.c
++++ b/managed_components/espressif__esp-nn/src/convolution/esp_nn_conv_esp32s3.c
+@@ -433,8 +433,11 @@ void esp_nn_conv_s8_esp32s3(const data_dims_t *input_dims,
+     const int32_t activation_min = conv_params->activation.min;
+     const int32_t activation_max = conv_params->activation.max;
+
+-    /* Grouped conv (filter_ch < input_ch): fall back to ansi which handles it */
+-    if (channels != filter_dims->channels) {
++    /* Grouped conv (filter_ch < input_ch): fall back to ansi which handles it.
++     * Vikunja #53: filter_dims->channels == 0 is the TFLM-glue convention for
++     * "unspecified, derive from input"; treat that as non-grouped. Without
++     * this, every Conv2D from TFLM mis-routes to ansi (full SIMD bypass). */
++    if (filter_dims->channels != 0 && channels != filter_dims->channels) {
+         esp_nn_conv_s8_ansi(input_dims, input, filter_dims, filter_data,
+                             bias, output_dims, out_data, conv_params, quant_data);
+         return;
