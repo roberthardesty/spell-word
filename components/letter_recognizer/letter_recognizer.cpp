@@ -26,14 +26,20 @@
  * Operational details that DO carry over verbatim, called out so they
  * survive review:
  *
- *   - Tensor arena lives in **internal SRAM** (MALLOC_CAP_INTERNAL).
- *     PSRAM placement is 3-5× slower for TFLM operators on ESP32-S3 and
- *     blows the ADR-0001 (500 ms early-commit floor) and ADR-0005 (~40 ms
- *     W-recovery re-inference) latency budgets, so SRAM is the design
- *     choice — not a tuning knob. The 51 KB DS-CNN's activations fit; size
- *     SPELL_TENSOR_ARENA_SIZE pessimistically and log arena_used_bytes()
- *     after AllocateTensors so the ceiling can be tightened to
- *     ≤ 1.2 × actual.
+ *   - Tensor arena AND model flatbuffer both live in **internal SRAM**
+ *     (MALLOC_CAP_INTERNAL). PSRAM placement of the arena is 3-5× slower
+ *     for TFLM operators on ESP32-S3, and PSRAM placement of the model
+ *     buffer is ~10× slower (every Conv2D/DepthwiseConv2D MAC reads the
+ *     weight tensor directly from the flatbuffer; bench reading shows
+ *     532 ms invoke with PSRAM model vs ~30-40 ms with internal model).
+ *     Both blow the ADR-0001 (500 ms early-commit floor) and ADR-0005
+ *     (~40 ms W-recovery re-inference) latency budgets, so SRAM is the
+ *     design choice — not a tuning knob. The 53 KB DS-CNN's activations
+ *     and weights both fit; size SPELL_TENSOR_ARENA_SIZE pessimistically
+ *     and log arena_used_bytes() after AllocateTensors so the ceiling can
+ *     be tightened to ≤ 1.2 × actual. SPELL_MODEL_INTERNAL_BUF_SIZE caps
+ *     the internal model copy (currently 64 KiB); on memory pressure
+ *     load_model_from_partition() falls back to PSRAM with a warning.
  *   - WDT for Core 1 IDLE is disabled in sdkconfig.defaults
  *     (CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n). With the SRAM arena
  *     Invoke() drops to ~30-40 ms (well under the WDT timeout), but the
@@ -222,23 +228,45 @@ static bool load_model_from_partition()
         return false;
     }
 
-    // Allocate (or reuse) model buffer in PSRAM.
+    // Allocate (or reuse) model buffer. Prefer internal SRAM — every
+    // Conv2D / DepthwiseConv2D MAC reads weights directly from this
+    // flatbuffer, and PSRAM-resident weights blow the ADR-0001 latency
+    // budget by ~10× (532 ms vs ~30-40 ms target on the 53 KiB model).
+    // The model partition is 256 KiB on flash but the live flatbuffer is
+    // ~53 KiB; we mirror up to SPELL_MODEL_INTERNAL_BUF_SIZE of it.
     if (!s_model_buf) {
+        size_t internal_alloc =
+            (part->size <= SPELL_MODEL_INTERNAL_BUF_SIZE)
+                ? part->size
+                : SPELL_MODEL_INTERNAL_BUF_SIZE;
         s_model_buf = static_cast<uint8_t *>(
-            heap_caps_malloc(part->size, MALLOC_CAP_SPIRAM));
-        if (!s_model_buf) {
-            ESP_LOGE(TAG, "PSRAM alloc for model buffer failed (%" PRIu32 " B)",
-                     part->size);
-            return false;
+            heap_caps_malloc(internal_alloc, MALLOC_CAP_INTERNAL));
+        if (s_model_buf) {
+            s_model_size = internal_alloc;
+            ESP_LOGI(TAG, "model buffer in internal SRAM (%u B)",
+                     (unsigned)internal_alloc);
+        } else {
+            // Internal pressure — fall back to PSRAM with a loud warning so
+            // bench debugging surfaces the latency hit.
+            ESP_LOGW(TAG, "internal alloc for model buffer failed (%u B) — "
+                          "falling back to PSRAM (invoke ~10× slower)",
+                     (unsigned)internal_alloc);
+            s_model_buf = static_cast<uint8_t *>(
+                heap_caps_malloc(part->size, MALLOC_CAP_SPIRAM));
+            if (!s_model_buf) {
+                ESP_LOGE(TAG, "PSRAM fallback alloc also failed (%" PRIu32 " B)",
+                         part->size);
+                return false;
+            }
+            s_model_size = part->size;
         }
     }
 
-    esp_err_t err = esp_partition_read(part, 0, s_model_buf, part->size);
+    esp_err_t err = esp_partition_read(part, 0, s_model_buf, s_model_size);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "partition read failed: %s", esp_err_to_name(err));
         return false;
     }
-    s_model_size = part->size;
 
     // Validate flatbuffer.
     const tflite::Model *model = tflite::GetModel(s_model_buf);
@@ -262,7 +290,18 @@ static bool setup_interpreter()
     if (!s_tensor_arena) {
         // Internal SRAM — PSRAM placement is 3-5× slower for TFLM ops on
         // ESP32-S3, blowing the ADR-0001 (early-commit) and ADR-0005
-        // (W-recovery) latency budgets.
+        // (W-recovery) latency budgets. Log the largest contiguous internal
+        // block before alloc so the SPELL_TENSOR_ARENA_SIZE ceiling can be
+        // sized against actual on-device DRAM headroom (FreeRTOS task stacks
+        // and the USB-Serial-JTAG driver fragment the heap below the 323 KiB
+        // figure heap_init reports).
+        size_t int_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+        size_t int_total   = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        ESP_LOGI(TAG, "pre-arena internal heap: %u B free, largest block %u B "
+                      "(arena will request %d B)",
+                 (unsigned)int_total, (unsigned)int_largest,
+                 SPELL_TENSOR_ARENA_SIZE);
+
         s_tensor_arena = static_cast<uint8_t *>(
             heap_caps_malloc(SPELL_TENSOR_ARENA_SIZE, MALLOC_CAP_INTERNAL));
         if (!s_tensor_arena) {
@@ -270,6 +309,9 @@ static bool setup_interpreter()
                      SPELL_TENSOR_ARENA_SIZE);
             return false;
         }
+        ESP_LOGI(TAG, "post-arena internal heap: %u B free, largest block %u B",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     }
 
     // Clean up previous interpreter (hot-reload path).
@@ -457,9 +499,30 @@ static void recognizer_task(void *arg)
         int64_t dt_quant_us = esp_timer_get_time() - t1;
 
         // ── TFLite Invoke ────────────────────────────────────────────
+        // Per-op timing: snapshot esp-tflite-micro's per-kernel accumulators
+        // before and after Invoke to break down which op dominates. Used for
+        // bring-up bench reads only; on a release build the externs are still
+        // pulled in (esp-nn always defines them) but the snapshot diff is
+        // cheap.
+        extern long long conv_total_time, dc_total_time, fc_total_time,
+                         pooling_total_time, softmax_total_time,
+                         add_total_time,  mul_total_time;
+        long long c0  = conv_total_time,    d0  = dc_total_time,
+                  f0  = fc_total_time,      p0  = pooling_total_time,
+                  s0  = softmax_total_time, a0  = add_total_time,
+                  m0  = mul_total_time;
+
         int64_t t2 = esp_timer_get_time();
         TfLiteStatus status = s_interpreter->Invoke();
         int64_t dt_invoke_us = esp_timer_get_time() - t2;
+
+        long long dc_conv  = conv_total_time    - c0;
+        long long dc_dc    = dc_total_time      - d0;
+        long long dc_fc    = fc_total_time      - f0;
+        long long dc_pool  = pooling_total_time - p0;
+        long long dc_smax  = softmax_total_time - s0;
+        long long dc_add   = add_total_time     - a0;
+        long long dc_mul   = mul_total_time     - m0;
 
         int dt_feat_ms   = (int)(dt_feat_us / 1000);
         int dt_quant_ms  = (int)(dt_quant_us / 1000);
@@ -472,6 +535,9 @@ static void recognizer_task(void *arg)
             ESP_LOGI(TAG, "timing: feat=%dms quant=%dms invoke=%dms total=%dms",
                      dt_feat_ms, dt_quant_ms, dt_invoke_ms,
                      dt_feat_ms + dt_quant_ms + dt_invoke_ms);
+            ESP_LOGI(TAG, "  per-op us: conv=%lld dwconv=%lld fc=%lld "
+                          "pool=%lld smax=%lld add=%lld mul=%lld",
+                     dc_conv, dc_dc, dc_fc, dc_pool, dc_smax, dc_add, dc_mul);
         }
 
         if (status != kTfLiteOk) {

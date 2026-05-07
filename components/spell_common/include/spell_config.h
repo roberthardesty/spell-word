@@ -152,12 +152,46 @@
 // =============================================================================
 
 #define SPELL_LETTER_TOP_K            5
-// Arena is allocated from internal SRAM (MALLOC_CAP_INTERNAL) — see the
-// comment block at the head of letter_recognizer.cpp. 256 KB is a
-// pessimistic ceiling for the 51 KB model (expected arena_used ≈ 100-150 KB).
-// Tighten to ≤ 1.2 × measured arena_used_bytes after on-board boot logs
-// confirm the actual figure.
-#define SPELL_TENSOR_ARENA_SIZE       (256 * 1024)
+// Tensor arena AND model flatbuffer both live in internal SRAM
+// (MALLOC_CAP_INTERNAL). PSRAM placement is 3-5× slower for TFLM
+// activations (arena) and even worse for weights (model), since every
+// Conv2D/DepthwiseConv2D MAC reads weights from the flatbuffer — see the
+// comment block at the head of letter_recognizer.cpp.
+//
+// Sizing on ESP32-S3 with 8 MB octal PSRAM and the production partition
+// table:
+//   - heap_init reports ~323 KiB internal DRAM
+//   - largest contiguous internal block at recognizer-init time (after
+//     FreeRTOS task stacks, USB-Serial-JTAG driver, audio_capture, and
+//     feat_extract pre-allocs) is ~252 KiB on 2026-05-07 hardware
+//
+// Measurements with the 53 KiB flat26_baseline_int8 model
+// (input [1,80,20,3] INT8, output [1,26] INT8):
+//   - arena_used_bytes = 100,920 B (98.5 KiB)
+//   - invoke time, model in PSRAM: 532 ms (blows ADR-0001 500 ms floor)
+//   - invoke time, model in internal SRAM: <see boot log on next flash>
+//
+// Historical bench notes (kept for review):
+//   - 256 KiB arena alone fails the internal alloc
+//   - 192 KiB arena alone allocates but starves USB-Serial-JTAG so the
+//     device soft-bricks (BOOT-button ROM recovery required)
+//   - 144 KiB arena + PSRAM model: works, but 532 ms invoke
+//   - 118 KiB arena + 64 KiB internal model: target — 30-40 ms invoke
+//
+// SPELL_TENSOR_ARENA_SIZE is sized at ≤ 1.2 × measured arena_used
+// (100,920 × 1.2 = 121,104 → 118 KiB = 120,832 B is the largest 1 KiB
+// multiple under the cap, leaving 17.7 KiB headroom for any kernel
+// scratch growth from esp-tflite-micro version bumps).
+//
+// SPELL_MODEL_INTERNAL_BUF_SIZE caps the internal-SRAM model copy. The
+// model partition is 256 KiB on flash, but the live flatbuffer is ~53
+// KiB; we only mirror the first 64 KiB into internal SRAM. If a future
+// model bumps over 64 KiB, AllocateTensors will fail (the flatbuffer's
+// internal pointers walk past the truncated buffer) — bump the cap and
+// re-bench. If the internal alloc fails outright (memory pressure),
+// load_model_from_partition() falls back to PSRAM and logs a warning.
+#define SPELL_TENSOR_ARENA_SIZE       (118 * 1024)
+#define SPELL_MODEL_INTERNAL_BUF_SIZE (64  * 1024)
 #define SPELL_MODEL_PARTITION_LABEL   "model"
 #define SPELL_INFERENCE_TASK_STACK    8192       // bytes; heavy buffers in PSRAM heap
 
