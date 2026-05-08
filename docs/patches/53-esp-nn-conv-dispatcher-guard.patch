@@ -2,13 +2,18 @@
 #
 # Target: managed_components/espressif__esp-nn/src/convolution/esp_nn_conv_esp32s3.c
 # Tested against: esp-nn 1.2.3 (per dependencies.lock at time of fix, 2026-05-07)
+# Marker:  "Vikunja #53"  (must be present in the patched file — this is how
+#          the build's auto-apply step detects "already applied").
 #
 # WHY THIS PATCH EXISTS
 # ---------------------
-# `managed_components/` is gitignored. Any `idf.py reconfigure` that triggers
-# the IDF Component Manager to re-fetch dependencies will silently overwrite
-# this fix and the build will regress to the broken-baseline 532 ms invoke.
-# After any dependency refresh, re-apply this patch before re-benching.
+# `managed_components/` is gitignored. The IDF Component Manager re-fetches
+# vendored deps on `idf.py reconfigure` / `fullclean` / fresh checkout, which
+# would silently overwrite this fix and regress invoke from 84 ms to 532 ms.
+# To prevent that, this patch is auto-applied at CMake configure time — see
+# docs/patches/README.md for the architecture and cmake/apply_patches.cmake
+# for the apply mechanics. You should not normally need to touch this file
+# by hand.
 #
 # WHAT IT DOES
 # ------------
@@ -18,7 +23,7 @@
 #     if (channels != filter_dims->channels) { ... fall back to ansi ... }
 # that misinterpreted that 0 as "different from input channels", so EVERY
 # Conv2D from TFLM mis-routed to esp_nn_conv_s8_ansi (the pure-C reference
-# kernel) and the SIMD paths were unreachable. Probe-2 cyc/MAC dropped from
+# kernel) and the SIMD paths were unreachable. Probe cyc/MAC dropped from
 # unmeasurable (probe never fired — call site unreachable) to 0.71 cyc/MAC
 # after this fix. Conv2D total dropped from 495 ms to 47 ms (10.5×). Total
 # invoke dropped from 532 ms to 84 ms cold / 76 ms warm (6.3×).
@@ -28,19 +33,29 @@
 # share the same comment style ("Grouped conv (filter_ch < input_ch): ...").
 # Upstream esp-nn 1.2.3 may not have had this guard at all.
 #
-# HOW TO APPLY
-# ------------
-# From repo root:
-#   patch -p1 < docs/patches/53-esp-nn-conv-dispatcher-guard.patch
-# Or apply by hand: change the `if (channels != filter_dims->channels)` line
-# in esp_nn_conv_s8_esp32s3() to also check filter_dims->channels != 0.
+# HOW TO APPLY (escape hatch only — normally automatic)
+# -----------------------------------------------------
+# `idf.py build` / `idf.py reconfigure` applies this automatically via the
+# CMake step in apply_patches.cmake. To apply by hand if the auto-apply is
+# disabled or you are operating outside the build:
+#   patch -p1 -i docs/patches/53-esp-nn-conv-dispatcher-guard.patch
+# To revert by hand:
+#   patch -R -p1 -i docs/patches/53-esp-nn-conv-dispatcher-guard.patch
+# Or by hand: change the `if (channels != filter_dims->channels)` line in
+# esp_nn_conv_s8_esp32s3() to also check filter_dims->channels != 0.
+#
+# IF AUTO-APPLY FAILS AT CONFIGURE TIME
+# -------------------------------------
+# Most likely cause: the upstream esp-nn version was bumped and the diff
+# context lines no longer match. See "If you see APPLY FAILED" in
+# docs/patches/README.md for the diagnosis playbook.
 #
 # LONG-TERM
 # ---------
 # The right fix is upstream — either esp-nn treats 0 as unspecified, or
-# the TFLM glue passes the actual filter channels. Until then this patch
-# must be re-applied after any managed_components refresh. Consider pinning
-# a forked esp-nn ref in main/idf_component.yml if this becomes painful.
+# the TFLM glue passes the actual filter channels. Once that lands and
+# the dependency is bumped past it, delete this patch and the matching
+# apply_repo_patch() call in the top-level CMakeLists.txt.
 
 --- a/managed_components/espressif__esp-nn/src/convolution/esp_nn_conv_esp32s3.c
 +++ b/managed_components/espressif__esp-nn/src/convolution/esp_nn_conv_esp32s3.c

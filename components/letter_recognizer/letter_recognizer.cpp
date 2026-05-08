@@ -382,18 +382,6 @@ static bool setup_interpreter()
     ESP_LOGI(TAG, "interpreter ready — arena used %u / %d B (%.0f%% of alloc)",
              (unsigned)arena_used, SPELL_TENSOR_ARENA_SIZE,
              100.0f * arena_used / SPELL_TENSOR_ARENA_SIZE);
-    // SIMD-engagement probe (Vikunja #53). esp-nn S3 asm paths assume
-    // 16-byte alignment; if the input tensor pointer (placed by the
-    // memory planner inside the arena) lands odd, the asm bails to
-    // a slow scalar fixup. Print &15 for arena base, model flatbuffer,
-    // and the input tensor data pointer.
-    ESP_LOGI(TAG, "  align: arena=%p&15=%zu model=%p&15=%zu input=%p&15=%zu",
-             (void*)s_tensor_arena,
-             (size_t)((uintptr_t)s_tensor_arena & 15),
-             (void*)s_model_buf,
-             (size_t)((uintptr_t)s_model_buf & 15),
-             (void*)s_input->data.int8,
-             (size_t)((uintptr_t)s_input->data.int8 & 15));
     ESP_LOGI(TAG, "  input: (%d,%d,%d,%d) %s, output dim0=%d %s",
              s_input->dims->data[0], s_input->dims->data[1],
              s_input->dims->data[2], s_input->dims->data[3],
