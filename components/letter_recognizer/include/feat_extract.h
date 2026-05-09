@@ -5,9 +5,9 @@
  *
  * Pipeline:
  *
- *   audio[12800] → pre-emphasis (0.97) → 79 × Hann-windowed frames →
+ *   audio[12800] → pre-emphasis (0.97) → 80 × Hann-windowed frames →
  *   512-pt FFT → power → mel filterbank[40] → ln → DCT-II[20] →
- *   stack with Δ[20] and ΔΔ[20] across time → tensor[79, 20, 3]
+ *   stack with Δ[20] and ΔΔ[20] across time → tensor[80, 20, 3]
  *
  * Output layout (NHWC, matches TFLite default):
  *

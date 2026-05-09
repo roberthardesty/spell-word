@@ -55,6 +55,7 @@
 
 #include "letter_recognizer.h"
 #include "feat_extract.h"
+#include "feat_norm.h"
 #include "spell_config.h"
 #include "spell_events.h"
 
@@ -155,7 +156,7 @@ static LetterProfiler s_profiler;
 
 // ── Feature workspace (MFCC + Δ + ΔΔ, NHWC) ──────────────────────────
 // Shape [SPELL_FEAT_N_FRAMES][SPELL_MFCC_N_COEFFS][SPELL_FEAT_N_CHANNELS],
-// = SPELL_FEAT_N_ELEMENTS floats. PSRAM-resident.
+// = SPELL_FEAT_N_ELEMENTS floats (80 × 20 × 3 = 4800). PSRAM-resident.
 static float *s_features = nullptr;
 
 // ── Task + stats ──────────────────────────────────────────────────────
@@ -516,6 +517,19 @@ static void recognizer_task(void *arg)
         int64_t t0 = esp_timer_get_time();
         feat_extract_compute(utt.pcm, (int)utt.n_samples, s_features);
         int64_t dt_feat_us = esp_timer_get_time() - t0;
+
+        // ── Per-coefficient/channel normalization ────────────────────
+        // (mfcc - mean) / std, broadcast over frames. The int8 quantization
+        // params (scale, zero_point) were calibrated against this post-norm
+        // distribution; skipping it shifts and rescales every input cell so
+        // the top-K probabilities become uncalibrated noise. norm_mean and
+        // norm_std are 60-element float arrays generated from the model
+        // handoff's .npy files (see tools/gen_norm_arrays/).
+        for (int i = 0; i < SPELL_FEAT_N_ELEMENTS; i++) {
+            int kc = i % SPELL_FEAT_NORM_LEN;
+            s_features[i] = (s_features[i] - spell_feat_norm_mean[kc])
+                            / spell_feat_norm_std[kc];
+        }
 
         // ── Quantize features → int8 input tensor ────────────────────
         int64_t t1 = esp_timer_get_time();

@@ -1,0 +1,4 @@
+# Host-build artifacts. Nothing today, but keep the file so future
+# scratch outputs land here instead of in the project root.
+__pycache__/
+*.pyc

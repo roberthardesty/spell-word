@@ -109,16 +109,25 @@
 #define SPELL_MFCC_N_COEFFS           20      // top-N DCT coefficients
 #define SPELL_MFCC_PRE_EMPHASIS       0.97f   // y[n] = x[n] - α·x[n-1]
 #define SPELL_FEAT_N_CHANNELS         3       // MFCC + Δ + ΔΔ
-#define SPELL_FEAT_N_FRAMES           79      // floor((12800 - 320) / 160) + 1
-                                              // ASSUMES tf-style center=False
-                                              // framing. If training uses
-                                              // librosa center=True you'll
-                                              // see 81; verify against the
-                                              // model's input_details.
+#define SPELL_FEAT_N_FRAMES           80      // training pipeline produces 80
+                                              // frames per 800 ms window
+                                              // (audio padded to 12960 samples
+                                              // before framing with hop=160,
+                                              // win=320). The firmware framer
+                                              // covers samples [t·160, t·160+320)
+                                              // and zero-fills any out-of-bounds
+                                              // tail, so producing 80 frames
+                                              // from a 12800-sample buffer
+                                              // matches the training byte-for-
+                                              // byte at every in-bounds index
+                                              // and at the trailing zero-pad.
+                                              // Bumped from 79 in Vikunja #52
+                                              // to match the model's input
+                                              // shape [1, 80, 20, 3].
 
 // Convenience: total floats in the feature tensor for one window.
 #define SPELL_FEAT_N_ELEMENTS \
-    (SPELL_FEAT_N_FRAMES * SPELL_MFCC_N_COEFFS * SPELL_FEAT_N_CHANNELS)         // 4 740
+    (SPELL_FEAT_N_FRAMES * SPELL_MFCC_N_COEFFS * SPELL_FEAT_N_CHANNELS)         // 4 800
 
 // =============================================================================
 // Energy gate
