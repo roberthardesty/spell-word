@@ -1,0 +1,6 @@
+# Host-build artifacts. Nothing committed today, but keep scratch outputs
+# from leaking into the project root.
+__pycache__/
+*.pyc
+*.npy
+*.wav
