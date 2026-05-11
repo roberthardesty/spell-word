@@ -349,16 +349,19 @@ def maybe_invoke_model(int8_input: np.ndarray, model_tflite: str) -> int:
     """Load the .tflite and invoke. Top-K printed to stdout. Soft-fails if
     tflite_runtime / tensorflow are not installed — keeps the script
     dependency-light."""
+    Interpreter = None
     try:
         from tflite_runtime.interpreter import Interpreter  # type: ignore
     except ImportError:
         try:
-            from tensorflow.lite import Interpreter  # type: ignore
+            import tensorflow as _tf  # type: ignore
+            Interpreter = _tf.lite.Interpreter
         except ImportError:
             sys.exit(
                 "--invoke requires tflite_runtime or tensorflow. Install one:\n"
                 "    pip install tflite-runtime\n"
-                "  (or `pip install tensorflow` for the larger runtime)"
+                "  (or `pip install tensorflow` for the larger runtime; tflite-runtime\n"
+                "  has no macOS arm64 wheels, so tensorflow is the macOS path)"
             )
 
     interp = Interpreter(model_path=model_tflite)

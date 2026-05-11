@@ -23,5 +23,7 @@ models/*.tflite
 .DS_Store
 .idea/
 .vscode/
+.venv/
+.venv-hitl/
 *.swp
 *~
